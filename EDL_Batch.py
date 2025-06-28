@@ -261,26 +261,26 @@ if __name__ == "__main__":
 To run: 
 
 # Basic processing with rotation and tilt correction:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots --plot_data --plot_boundaries
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots --plot_data --plot_boundaries
 
 # Processing with drift correction and rotation:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --skip_minutes 20 --plot_data --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --skip_minutes 20 --plot_data --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots
 
 # Processing with drift correction and rotation, plotting both uncorrected and corrected data:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --plot_data --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --plot_data --save_plots
 
 # Processing with tilt correction, plotting both uncorrected and tilt-corrected data:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --tilt_correction --plot_tilt --plot_data --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --tilt_correction --plot_tilt --plot_data --save_plots
 
 # Basic processing without any corrections:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots
 
 # Processing with timezone conversion (e.g., to local time):
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "Australia/Sydney" --plot_data --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "Australia/Sydney" --plot_data --save_plots
 
 # Processing with timezone conversion and all corrections:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "America/New_York" --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_data --save_plots
+python Test_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "America/New_York" --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_data --save_plots
 
 # Example command with all options:
-# python EDL_Batch.py --input_dir . --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --smoothing_method median --skip_minutes 10 5 --save_plots --max_workers 4
+# python Test_Batch.py --input_dir . --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --smoothing_method median --skip_minutes 10 5 --save_plots --max_workers 4
 """

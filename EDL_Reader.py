@@ -158,7 +158,8 @@ class ASCIIReader:
                 
                 # Check for NaNs and drop rows if necessary
                 if df.isnull().values.any():
-                    n_nans = df.isnull().any(axis=1).sum()
+                    # Count rows with any NaN values
+                    n_nans = len(df[df.isnull().any(axis=1)])
                     write_log(f"WARNING: Found {n_nans} rows with NaN values in concatenated data. Dropping these rows.", level="WARNING")
                     df = df.dropna().reset_index(drop=True)
                 

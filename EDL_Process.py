@@ -6,7 +6,7 @@ import pandas as pd
 import datetime
 import matplotlib.pyplot as plt
 from scipy.signal import welch, coherence, spectrogram  # Added spectrogram
-from EDL_Reader import ASCIIReader  # Updated import
+from EDL_Reader import ASCIIReader  # Updated ASCII reader module
 import configparser
 import re
 import traceback
@@ -1749,25 +1749,6 @@ class ProcessASCII:
                 if 'rBy' in processed_df.columns:
                     processed_df['rBy_original'] = processed_df['rBy'].copy()
 
-            # Generate processing config file
-            if gps_data:
-                has_remote = self.remote_reference is not None
-                
-                # Add sample rate suffix to site name if decimation is applied
-                site_name_for_config = self.site_name
-                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
-                    suffix = get_sample_rate_suffix(sample_interval)
-                    site_name_for_config = f"{self.site_name}{suffix}"
-                
-                config_path = generate_processing_config(
-                    site_name_for_config, 
-                    gps_data, 
-                    sample_interval, 
-                    has_remote_reference=has_remote,
-                    remote_reference_site=self.remote_reference,
-                    output_dir=self.output_dir
-                )
-                write_site_log(f"Generated processing config file: {config_path}")
             
             # Apply tilt correction
             tilt_angle_degrees = None
@@ -1817,13 +1798,30 @@ class ProcessASCII:
                 
                 # Add sample rate suffix to filename for all decimation factors
                 suffix = get_sample_rate_suffix(sample_interval)
-                filename = f"{self.site_name}{suffix}_output_processed.txt"
-                processed_output_path = os.path.join(self.output_dir, filename)
-                # Save with three decimal places for all float columns, no headers
+                # New naming: SITENAME_10Hz_Process.txt
+                filename = f"{self.site_name}{suffix}_Process.txt"
+                processed_output_path = os.path.join(".", filename)
                 float_cols = output_df.select_dtypes(include=['float', 'float64', 'float32']).columns
                 output_df[float_cols] = output_df[float_cols].round(3)
                 output_df.to_csv(processed_output_path, index=False, header=False, sep='\t', float_format='%.3f')
                 write_site_log(f"Processed data saved to {processed_output_path}")
+
+                # Generate config file after processed data is saved
+                if gps_data:
+                    has_remote = self.remote_reference is not None
+                    site_name_for_config = self.site_name
+                    if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                        suffix = get_sample_rate_suffix(sample_interval)
+                        site_name_for_config = f"{self.site_name}{suffix}"
+                    config_path = generate_processing_config(
+                        site_name_for_config,
+                        gps_data,
+                        sample_interval,
+                        has_remote_reference=has_remote,
+                        remote_reference_site=self.remote_reference,
+                        output_file_path=processed_output_path
+                    )
+                    write_site_log(f"Generated processing config file: {config_path}")
             else:
                 write_site_log(f"Skipping saving processed data (not requested)")
             
@@ -2008,7 +2006,7 @@ class ProcessASCII:
             write_log(f"Error in frequency analysis for {identifier}: {e}", level="ERROR")
 
     def run_lemimt_processing(self, processed_file_path):
-        """Run lemimt.exe on the processed output file.
+        """Run lemimt.exe on the processed output file with improved error handling and permissions.
         
         Args:
             processed_file_path (str): Path to the processed output file
@@ -2019,48 +2017,274 @@ class ProcessASCII:
         try:
             import platform
             import subprocess
+            import stat
+            import shutil
+            import traceback
+            
+            # Enhanced platform detection and handling
+            current_platform = platform.system()
+            write_site_log(f"Platform detected: {current_platform}")
             
             # Check if we're on Windows
-            if platform.system() != "Windows":
-                write_site_log(f"lemimt.exe can only run on Windows. Current platform: {platform.system()}", level="WARNING")
-                write_site_log(f"To run lemimt processing, transfer the file {processed_file_path} to a Windows machine", level="INFO")
-                write_site_log(f"Command to run on Windows: {self.lemimt_path} -r -f {processed_file_path}", level="INFO")
+            if current_platform != "Windows":
+                write_site_log(f"lemimt.exe can only run on Windows. Current platform: {current_platform}", level="WARNING")
+                write_site_log(f"To run lemimt processing, transfer the file {os.path.abspath(processed_file_path)} to a Windows machine", level="INFO")
+                filename_only = os.path.basename(processed_file_path)
+                write_site_log(f"Command to run on Windows: {self.lemimt_path} -r -f {filename_only}", level="INFO")
+                
+                # Generate a batch script for easy execution on Windows
+                self._generate_windows_batch_script(processed_file_path, filename_only)
                 return False
             
-            # Check if lemimt.exe exists
-            if not os.path.exists(self.lemimt_path):
-                write_site_log(f"lemimt.exe not found at: {self.lemimt_path}", level="ERROR")
+            # Enhanced executable validation
+            lemimt_path = self._validate_lemimt_executable()
+            if not lemimt_path:
                 return False
             
-            # Check if processed file exists
-            if not os.path.exists(processed_file_path):
-                write_site_log(f"Processed file not found: {processed_file_path}", level="ERROR")
+            # Enhanced file validation
+            if not self._validate_input_files(processed_file_path):
                 return False
             
-            # Construct the command
-            cmd = [self.lemimt_path, "-r", "-f", os.path.abspath(processed_file_path)]
+            # Get working directory and ensure we're in the right place
+            working_dir = os.path.dirname(os.path.abspath(processed_file_path))
+            if not working_dir:
+                working_dir = os.getcwd()
+            
+            # Use only the filename for the lemimt command
+            filename_only = os.path.basename(processed_file_path)
+            
+            # Construct the command with enhanced options
+            cmd = [lemimt_path, "-r", "-f", filename_only]
+            write_site_log(f"Working directory: {working_dir}")
             write_site_log(f"Running lemimt command: {' '.join(cmd)}")
             
-            # Run the command
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            # Enhanced subprocess execution with better error handling
+            result = self._execute_lemimt_command(cmd, working_dir)
             
-            if result.returncode == 0:
+            if result['success']:
                 write_site_log(f"lemimt processing completed successfully")
-                if result.stdout:
-                    write_site_log(f"lemimt output: {result.stdout}")
+                if result.get('stdout'):
+                    write_site_log(f"lemimt output: {result['stdout']}")
+                
+                # TODO: Uncomment the following lines to delete processed data and config files after lemimt processing
+                # self._cleanup_processed_files(processed_file_path)
+                
                 return True
             else:
-                write_site_log(f"lemimt processing failed with return code: {result.returncode}", level="ERROR")
-                if result.stderr:
-                    write_site_log(f"lemimt error: {result.stderr}", level="ERROR")
+                write_site_log(f"lemimt processing failed: {result.get('error', 'Unknown error')}", level="ERROR")
+                if result.get('stderr'):
+                    write_site_log(f"lemimt stderr: {result['stderr']}", level="ERROR")
                 return False
                 
-        except subprocess.TimeoutExpired:
-            write_site_log(f"lemimt processing timed out after 5 minutes", level="ERROR")
-            return False
         except Exception as e:
-            write_site_log(f"Error running lemimt: {e}", level="ERROR")
+            write_site_log(f"Unexpected error running lemimt: {e}", level="ERROR")
+            write_site_log(f"Traceback: {traceback.format_exc()}", level="ERROR")
             return False
+
+    def _validate_lemimt_executable(self):
+        """Validate the lemimt executable at the specified path."""
+        try:
+            import stat
+            
+            # Check if the specified path exists
+            if not os.path.exists(self.lemimt_path):
+                write_site_log(f"lemimt.exe not found at: {self.lemimt_path}", level="ERROR")
+                return None
+            
+            lemimt_path = os.path.abspath(self.lemimt_path)
+            write_site_log(f"Found lemimt.exe at: {lemimt_path}")
+            
+            # Check if it's actually an executable
+            if not os.access(lemimt_path, os.X_OK):
+                write_site_log(f"lemimt.exe is not executable: {lemimt_path}", level="ERROR")
+                # Try to make it executable (Windows doesn't need this, but good practice)
+                try:
+                    os.chmod(lemimt_path, os.stat(lemimt_path).st_mode | stat.S_IEXEC)
+                    write_site_log(f"Made lemimt.exe executable")
+                except Exception as e:
+                    write_site_log(f"Could not make lemimt.exe executable: {e}", level="WARNING")
+            
+            # Validate it's actually the right file
+            if not lemimt_path.lower().endswith('.exe'):
+                write_site_log(f"Warning: lemimt path doesn't end with .exe: {lemimt_path}", level="WARNING")
+            
+            return lemimt_path
+            
+        except Exception as e:
+            write_site_log(f"Error validating lemimt executable: {e}", level="ERROR")
+            return None
+
+    def _validate_input_files(self, processed_file_path):
+        """Validate that all required input files exist."""
+        try:
+            # Check processed data file
+            if not os.path.exists(processed_file_path):
+                write_site_log(f"Processed data file not found: {processed_file_path}", level="ERROR")
+                return False
+            
+            # Check if file is readable
+            if not os.access(processed_file_path, os.R_OK):
+                write_site_log(f"Processed data file is not readable: {processed_file_path}", level="ERROR")
+                return False
+            
+            # Check file size (should not be empty)
+            file_size = os.path.getsize(processed_file_path)
+            if file_size == 0:
+                write_site_log(f"Processed data file is empty: {processed_file_path}", level="ERROR")
+                return False
+            
+            write_site_log(f"Processed data file validated: {processed_file_path} ({file_size} bytes)")
+            
+            # Check for corresponding config file
+            config_file_path = os.path.splitext(processed_file_path)[0] + ".cfg"
+            if not os.path.exists(config_file_path):
+                write_site_log(f"Config file not found: {config_file_path}", level="WARNING")
+                # This is not fatal, lemimt might work without it
+            else:
+                write_site_log(f"Config file found: {config_file_path}")
+            
+            return True
+            
+        except Exception as e:
+            write_site_log(f"Error validating input files: {e}", level="ERROR")
+            return False
+
+    def _execute_lemimt_command(self, cmd, working_dir):
+        """Execute the lemimt command with enhanced error handling."""
+        try:
+            import platform
+            import subprocess
+            
+            # Set up environment variables for better compatibility
+            env = os.environ.copy()
+            
+            # Add current directory to PATH if not already there
+            current_dir = os.getcwd()
+            if current_dir not in env.get('PATH', ''):
+                env['PATH'] = current_dir + os.pathsep + env.get('PATH', '')
+            
+            write_site_log(f"Executing command in directory: {working_dir}")
+            write_site_log(f"Command: {' '.join(cmd)}")
+            
+            # Run the command with enhanced options
+            result = subprocess.run(
+                cmd,
+                cwd=working_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 minute timeout (increased from 5)
+                shell=False,  # Explicitly set to False for security
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+            )
+            
+            return {
+                'success': result.returncode == 0,
+                'returncode': result.returncode,
+                'stdout': result.stdout.strip() if result.stdout else None,
+                'stderr': result.stderr.strip() if result.stderr else None,
+                'error': None
+            }
+            
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'error': f"lemimt processing timed out after 10 minutes",
+                'returncode': -1
+            }
+        except FileNotFoundError:
+            return {
+                'success': False,
+                'error': f"lemimt executable not found: {cmd[0]}",
+                'returncode': -1
+            }
+        except PermissionError:
+            return {
+                'success': False,
+                'error': f"Permission denied running lemimt. Try running as administrator.",
+                'returncode': -1
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"Unexpected error: {str(e)}",
+                'returncode': -1
+            }
+
+    def _generate_windows_batch_script(self, processed_file_path, filename_only):
+        """Generate a Windows batch script for easy lemimt execution."""
+        try:
+            batch_content = f"""@echo off
+echo Running lemimt processing for {filename_only}
+echo.
+
+REM Check if lemimt.exe exists
+if not exist "lemimt.exe" (
+    echo ERROR: lemimt.exe not found in current directory
+    echo Please ensure lemimt.exe is in the same directory as this batch file
+    pause
+    exit /b 1
+)
+
+REM Check if input file exists
+if not exist "{filename_only}" (
+    echo ERROR: Input file {filename_only} not found
+    echo Please ensure the processed data file is in the same directory
+    pause
+    exit /b 1
+)
+
+echo Found lemimt.exe and {filename_only}
+echo Running: lemimt.exe -r -f {filename_only}
+echo.
+
+REM Run lemimt
+lemimt.exe -r -f {filename_only}
+
+if %ERRORLEVEL% EQU 0 (
+    echo.
+    echo SUCCESS: lemimt processing completed successfully
+) else (
+    echo.
+    echo ERROR: lemimt processing failed with error code %ERRORLEVEL%
+)
+
+echo.
+pause
+"""
+            
+            batch_filename = f"run_lemimt_{os.path.splitext(filename_only)[0]}.bat"
+            batch_path = os.path.join(os.path.dirname(processed_file_path), batch_filename)
+            
+            with open(batch_path, 'w') as f:
+                f.write(batch_content)
+            
+            write_site_log(f"Generated Windows batch script: {batch_path}")
+            write_site_log(f"Transfer this file along with {filename_only} to a Windows machine")
+            
+        except Exception as e:
+            write_site_log(f"Error generating batch script: {e}", level="WARNING")
+
+    def _cleanup_processed_files(self, processed_file_path):
+        """Clean up processed data and config files after successful lemimt processing."""
+        try:
+            import os
+            
+            processed_file_name = os.path.basename(processed_file_path)
+            config_file_name = processed_file_name.replace('.txt', '.cfg')
+            
+            # Delete processed data file
+            if os.path.exists(processed_file_name):
+                os.remove(processed_file_name)
+                write_site_log(f"Deleted processed data file: {processed_file_name}")
+            
+            # Delete config file
+            if os.path.exists(config_file_name):
+                os.remove(config_file_name)
+                write_site_log(f"Deleted config file: {config_file_name}")
+                
+        except Exception as e:
+            write_site_log(f"Error during cleanup: {e}", level="WARNING")
 
 
 def read_processing_config(processing_file="Processing.txt"):
@@ -2104,81 +2328,106 @@ def read_processing_config(processing_file="Processing.txt"):
         return {}
 
 
-def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
-                              remote_reference_site=None, output_dir="outputs"):
-    """Generate a processing configuration file based on the MATLAB code structure.
+def decimal_degrees_to_degrees_minutes(decimal_degrees, is_latitude=True):
+    """Convert decimal degrees to degrees-minutes format with hemisphere indicator.
     
+    Args:
+        decimal_degrees (float): Decimal degrees (can be positive or negative)
+        is_latitude (bool): True if converting latitude, False if longitude
+        
+    Returns:
+        str: Formatted string in "DD MM.MMMMMM,H" format where:
+             DD = degrees (integer)
+             MM.MMMMMM = minutes (decimal)
+             H = hemisphere (N/S for latitude, E/W for longitude)
+    
+    Examples:
+        decimal_degrees_to_degrees_minutes(32.16071, True) -> "32 9.64273,N"
+        decimal_degrees_to_degrees_minutes(-5.62940, False) -> "5 37.76425,W"
+    """
+    # Determine hemisphere based on sign and coordinate type
+    if is_latitude:
+        # Latitude: positive = North (N), negative = South (S)
+        hemisphere = 'N' if decimal_degrees >= 0 else 'S'
+    else:
+        # Longitude: positive = East (E), negative = West (W)
+        hemisphere = 'E' if decimal_degrees >= 0 else 'W'
+    
+    # Work with absolute value
+    abs_degrees = abs(decimal_degrees)
+    
+    # Extract degrees (integer part)
+    degrees = int(abs_degrees)
+    
+    # Calculate minutes (decimal part)
+    minutes = (abs_degrees - degrees) * 60.0
+    
+    # Format: "DD MM.MMMMMM,H"
+    return f"{degrees} {minutes:.5f},{hemisphere}"
+
+
+def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
+                              remote_reference_site=None, output_file_path=None):
+    """Generate a processing configuration file based on the MATLAB code structure.
     Args:
         site_name (str): Name of the site being processed
         gps_data (dict): Dictionary containing GPS coordinates and elevation
         sample_interval (float): Sampling interval in seconds
         has_remote_reference (bool): Whether remote reference processing is used
         remote_reference_site (str): Name of the remote reference site
-        output_dir (str): Directory to save the config file
-        
+        output_file_path (str): Full path to the processed data file (for naming .cfg)
     Returns:
         str: Path to the generated config file
     """
-    # Create filename to match the output processed text file name
-    config_filename = f"{site_name}_output_processed.cfg"
-    config_path = os.path.join(output_dir, config_filename)
-    
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    
-    # Extract GPS data
-    latitude = gps_data.get('latitude', '0.0')
-    longitude = gps_data.get('longitude', '0.0')
-    elevation = gps_data.get('altitude', '0.0')
-    
-    # Magnetic declination (you may need to calculate this based on location and date)
-    # For now, using a placeholder - this should be calculated properly
-    declination = '0.0'  # TODO: Calculate actual declination
-    
-    # Determine number of channels
-    if has_remote_reference:
-        nchan = 7  # Bx, By, Bz, Ex, Ey + rBx, rBy
+    if output_file_path:
+        config_path = os.path.splitext(output_file_path)[0] + ".cfg"
     else:
-        nchan = 5  # Bx, By, Bz, Ex, Ey
-    
-    # Channel names (these should match your actual channel names)
-    C1 = 'Bx'  # First magnetic channel
-    C2 = 'By'  # Second magnetic channel  
-    C3 = 'Ex'  # First electric channel
-    C4 = 'Ey'  # Second electric channel
-    R1 = 'rBx' if has_remote_reference else None  # Remote reference Bx
-    R2 = 'rBy' if has_remote_reference else None  # Remote reference By
-    
+        # fallback for legacy calls
+        suffix = get_sample_rate_suffix(sample_interval)
+        config_filename = f"{site_name}{suffix}_Process.cfg"
+        config_path = os.path.join(".", config_filename)
+    # Only create directory if not current dir
+    if os.path.dirname(config_path) not in ("", "."):
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    latitude = gps_data.get('latitude', 0.0)
+    longitude = gps_data.get('longitude', 0.0)
+    elevation = gps_data.get('altitude', 0.0)
+    latitude_dm = decimal_degrees_to_degrees_minutes(latitude, is_latitude=True)
+    longitude_dm = decimal_degrees_to_degrees_minutes(longitude, is_latitude=False)
+    declination = '0.0'  # TODO: Calculate actual declination
+    nchan = 7 if has_remote_reference else 5
+    C1 = '1'
+    C2 = '1'
+    C3 = '1'
+    C4 = '1'
+    C5 = '1'
+    R1 = '1' if has_remote_reference else None
+    R2 = '1' if has_remote_reference else None
     with open(config_path, 'w') as f:
-        # Write header information
         f.write(f"SITE {site_name}\n")
-        f.write(f"LATITUDE {latitude}\n")
-        f.write(f"LONGITUDE {longitude}\n")
+        f.write(f"LATITUDE {latitude_dm}\n")
+        f.write(f"LONGITUDE {longitude_dm}\n")
         f.write(f"ELEVATION {elevation}\n")
         f.write(f"DECLINATION {declination}\n")
         f.write(f"SAMPLING {sample_interval}\n\n")
         f.write(f"NCHAN {nchan}\n")
-        
-        # Write channel configuration
         if has_remote_reference:
-            # MT - with Remote Reference
             f.write(f"  1   {C1} 1  l120new.rsp\n")
             f.write(f"  2   {C2} 1  l120new.rsp\n")
-            f.write(f"  3   Bz 1  l120new.rsp\n")  # Added Bz channel
-            f.write(f"  4   {C3} 1  e000.rsp\n")
-            f.write(f"  5   {C4} 1  e000.rsp\n")
+            f.write(f"  3   {C3} 1  l120new.rsp\n")
+            f.write(f"  4   {C4} 1  e000.rsp\n")
+            f.write(f"  5   {C5} 1  e000.rsp\n")
             f.write(f"  6   {R1} 1  l120new.rsp\n")
             f.write(f"  7   {R2} 1  l120new.rsp\n")
             f.write(f"NREFCH        2\n")
         else:
-            # MT - Single Site
             f.write(f"  1   {C1} 1  l120new.rsp\n")
             f.write(f"  2   {C2} 1  l120new.rsp\n")
-            f.write(f"  3   Bz 1  l120new.rsp\n")  # Added Bz channel
-            f.write(f"  4   {C3} 1  e000.rsp\n")
-            f.write(f"  5   {C4} 1  e000.rsp\n")
-    
+            f.write(f"  3   {C3} 1  l120new.rsp\n")
+            f.write(f"  4   {C4} 1  e000.rsp\n")
+            f.write(f"  5   {C5} 1  e000.rsp\n")
     write_log(f"Generated processing config file: {config_path}")
+    write_log(f"Coordinates: Lat={latitude_dm}, Lon={longitude_dm}")
     return config_path
 
 
@@ -2567,23 +2816,22 @@ if __name__ == "__main__":
         
         # Run lemimt processing if requested
         if args.run_lemimt and args.save_processed_data:
-            # Find the processed output file
+            # Find the processed output file in current directory
             site_name = os.path.basename(args.input_dir)
-            output_dir = f"outputs/{site_name}"
             
-            # Determine the filename based on decimation factor
+            # Determine the filename based on decimation factor using new naming convention
             if decimation_factor == 1:
-                processed_file = f"{output_dir}/{site_name}_output_processed.txt"
+                processed_file = os.path.join(".", f"{site_name}_10Hz_Process.txt")
             else:
                 sample_interval = processor.metadata.get("sample_interval", 0.1)
                 suffix = get_sample_rate_suffix(sample_interval * decimation_factor)
-                processed_file = f"{output_dir}/{site_name}_{suffix}_output_processed.txt"
+                processed_file = os.path.join(".", f"{site_name}{suffix}_Process.txt")
             
             # Check if the file exists, if not try alternative naming patterns
             if not os.path.exists(processed_file):
-                # Try to find the actual processed file by looking in the output directory
+                # Try to find the actual processed file by looking in the current directory
                 import glob
-                pattern = f"{output_dir}/{site_name}*_output_processed.txt"
+                pattern = os.path.join(".", f"{site_name}*_Process.txt")
                 matching_files = glob.glob(pattern)
                 if matching_files:
                     processed_file = matching_files[0]  # Use the first matching file
@@ -2594,6 +2842,27 @@ if __name__ == "__main__":
             
             if os.path.exists(processed_file):
                 write_log(f"Running lemimt processing on: {processed_file}")
+                
+                # Generate config file just before running lemimt
+                try:
+                    # Try to get GPS data from the processor instance or use empty dict
+                    gps_data = getattr(processor, 'gps_data', {})
+                    sample_interval = processor.metadata.get("sample_interval", 0.1)
+                    has_remote_reference = processor.remote_reference is not None
+                    remote_reference_site = processor.remote_reference
+                    
+                    config_file = generate_processing_config(
+                        site_name=site_name,
+                        gps_data=gps_data,
+                        sample_interval=sample_interval,
+                        has_remote_reference=has_remote_reference,
+                        remote_reference_site=remote_reference_site,
+                        output_file_path=processed_file
+                    )
+                    write_log(f"Generated config file for lemimt: {config_file}")
+                except Exception as e:
+                    write_log(f"Warning: Could not generate config file: {e}", level="WARNING")
+                
                 success = processor.run_lemimt_processing(processed_file)
                 if success:
                     write_log(f"lemimt processing completed successfully for {processed_file}")
@@ -2783,7 +3052,7 @@ python EDL_Process.py --input_dir HDD5449 --log_first_rows --plot_data --apply_d
 # BATCH PROCESSING EXAMPLES
 # =========================
 
-# For batch processing multiple sites, use Test_Batch.py:
+# For batch processing multiple sites, use EDL_Batch.py:
 python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data
 
 # Batch processing with corrections:
