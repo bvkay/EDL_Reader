@@ -1,0 +1,2835 @@
+import os
+import io
+import argparse
+import numpy as np
+import pandas as pd
+import datetime
+import matplotlib.pyplot as plt
+from scipy.signal import welch, coherence, spectrogram  # Added spectrogram
+from EDL_Reader import ASCIIReader  # Updated import
+import configparser
+import re
+import traceback
+import glob
+from math import radians, cos, sin, asin, sqrt
+import matplotlib.dates as mdates
+from scipy.signal import windows
+
+# Global logging configuration
+LOG_LEVELS = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+CURRENT_LOG_LEVEL = "INFO"  # Can be overridden
+BATCH_MODE = False  # Set to True during batch processing
+SITE_NAME = "Unknown"  # Current site being processed
+
+# Main log file for batch processing
+MAIN_LOG_FILE = "process_ascii.log"
+
+def set_log_level(level):
+    """Set the global log level."""
+    global CURRENT_LOG_LEVEL
+    if level.upper() in LOG_LEVELS:
+        CURRENT_LOG_LEVEL = level.upper()
+    else:
+        print(f"Invalid log level: {level}. Using INFO.")
+        CURRENT_LOG_LEVEL = "INFO"
+
+def set_batch_mode(enabled=True):
+    """Enable or disable batch mode logging."""
+    global BATCH_MODE
+    BATCH_MODE = enabled
+
+def set_site_name(site_name):
+    """Set the current site name for logging."""
+    global SITE_NAME
+    SITE_NAME = site_name
+
+def get_site_log_file(site_name):
+    """Get the site-specific log file path."""
+    return f"{site_name}.log"
+
+def write_log(message, level="INFO", site_name=None):
+    """Enhanced logging function with site-specific files and level filtering.
+    
+    Args:
+        message (str): The log message.
+        level (str, optional): Log level. Defaults to "INFO".
+        site_name (str, optional): Site name for site-specific logging.
+    """
+    # Check log level filtering
+    if LOG_LEVELS.get(level.upper(), 0) < LOG_LEVELS.get(CURRENT_LOG_LEVEL, 0):
+        return
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    site_prefix = f"[{site_name or SITE_NAME}] " if site_name or SITE_NAME != "Unknown" else ""
+    log_message = f"{timestamp} - {level.upper()} - {site_prefix}{message}\n"
+    
+    # Write to main log file
+    with open(MAIN_LOG_FILE, "a", encoding="utf-8") as log_file:
+        log_file.write(log_message)
+    
+    # Write to site-specific log file if in batch mode and site name is provided
+    if BATCH_MODE and (site_name or SITE_NAME != "Unknown"):
+        site_log_file = get_site_log_file(site_name or SITE_NAME)
+        with open(site_log_file, "a", encoding="utf-8") as site_log:
+            site_log.write(log_message)
+    
+    # Print to console for ERROR and WARNING levels, or if not in batch mode
+    if level.upper() in ["ERROR", "WARNING"] or not BATCH_MODE:
+        print(log_message.strip())
+
+def write_batch_log(message, level="INFO"):
+    """Write batch-specific log messages."""
+    write_log(message, level, "BATCH")
+
+def write_site_log(message, level="INFO"):
+    """Write site-specific log messages."""
+    write_log(message, level, SITE_NAME)
+
+def create_batch_summary(sites, results, start_time):
+    """Create a batch processing summary report.
+    
+    Args:
+        sites (list): List of sites processed
+        results (dict): Results for each site
+        start_time (datetime): Batch start time
+    """
+    end_time = datetime.datetime.now()
+    duration = end_time - start_time
+    
+    summary = f"""
+{'='*80}
+BATCH PROCESSING SUMMARY
+{'='*80}
+Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}
+End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}
+Duration: {duration}
+Total Sites: {len(sites)}
+
+SITE RESULTS:
+{'-'*40}"""
+    
+    successful = 0
+    failed = 0
+    
+    for site in sites:
+        if site in results:
+            status = results[site].get('status', 'UNKNOWN')
+            if status == 'SUCCESS':
+                successful += 1
+                summary += f"\n✓ {site}: SUCCESS"
+                if 'data_shape' in results[site]:
+                    summary += f" (Data: {results[site]['data_shape']})"
+            else:
+                failed += 1
+                summary += f"\n✗ {site}: FAILED"
+                if 'error' in results[site]:
+                    summary += f" - {results[site]['error']}"
+        else:
+            failed += 1
+            summary += f"\n✗ {site}: NOT PROCESSED"
+    
+    summary += f"""
+
+SUMMARY:
+{'-'*40}
+Successful: {successful}
+Failed: {failed}
+Success Rate: {(successful/len(sites)*100):.1f}%
+
+Log Files:
+- Main log: {MAIN_LOG_FILE}
+- Site logs: {', '.join([f'{site}.log' for site in sites])}
+{'='*80}
+"""
+    
+    # Write summary to main log
+    with open(MAIN_LOG_FILE, "a", encoding="utf-8") as log_file:
+        log_file.write(summary)
+    
+    # Print summary to console
+    print(summary)
+    
+    return summary
+
+def dict_to_datetime(time_dict):
+    """Converts a time dictionary to a datetime object.
+    
+    Args:
+        time_dict (dict): Dictionary with keys "year", "month", "day", "hour", "minute", "second".
+    
+    Returns:
+        datetime.datetime: Constructed datetime.
+    """
+    return datetime.datetime(
+        year=time_dict["year"],
+        month=time_dict["month"],
+        day=time_dict["day"],
+        hour=time_dict["hour"],
+        minute=time_dict["minute"],
+        second=time_dict["second"]
+    )
+
+
+def apply_drift_correction_to_df(df, metadata):
+    """Applies linear drift correction to the DataFrame.
+    
+    Correction: corrected_time = time + (time / total_duration) * time_drift,
+    and adds a datetime column.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with a 'time' column (seconds from survey start).
+        metadata (dict): Contains "start_time", "finish_time", and "time_drift".
+    
+    Returns:
+        pd.DataFrame: DataFrame with "time_corrected" and "time_corrected_dt".
+    """
+    try:
+        write_log("Starting drift correction calculation...")
+        write_log(f"Input DataFrame shape: {df.shape}")
+        write_log(f"Input DataFrame columns: {list(df.columns)}")
+        
+        # Check for NaNs in time column
+        if df['time'].isnull().any():
+            n_nans = df['time'].isnull().sum()
+            write_log(f"WARNING: Found {n_nans} NaN values in time column", level="WARNING")
+        
+        start_dt = dict_to_datetime(metadata["start_time"])
+        finish_dt = dict_to_datetime(metadata["finish_time"])
+        total_duration = (finish_dt - start_dt).total_seconds()
+        drift_value = metadata["time_drift"]
+        
+        write_log(f"Start time: {start_dt}")
+        write_log(f"Finish time: {finish_dt}")
+        write_log(f"Total duration: {total_duration} seconds")
+        write_log(f"Drift value: {drift_value}")
+        
+        # Check for division by zero or very small total_duration
+        if total_duration <= 0:
+            write_log("WARNING: Total duration is zero or negative, skipping drift correction", level="WARNING")
+            df["time_corrected"] = df["time"]
+            df["time_corrected_dt"] = df["time"].apply(
+                lambda s: start_dt + datetime.timedelta(seconds=s)
+            )
+            return df
+        
+        df["time_corrected"] = df["time"] + (df["time"] / total_duration) * drift_value
+        df["time_corrected_dt"] = df["time_corrected"].apply(
+            lambda s: start_dt + datetime.timedelta(seconds=s)
+        )
+        
+        write_log("Drift correction calculation completed successfully")
+        return df
+        
+    except Exception as e:
+        write_log(f"Error in drift correction: {e}", level="ERROR")
+        write_log(f"Drift correction traceback: {traceback.format_exc()}", level="ERROR")
+        raise
+
+
+def convert_counts_to_physical_units(df, metadata):
+    """Converts raw counts into physical units.
+    
+    Magnetics:
+      Bx = (chan0/2**23 - 1) * 70000  
+      Bz = (chan1/2**23 - 1) * 70000  
+      By = -(chan2/2**23 - 1) * 70000  
+    Electrics:
+      Ex = -(chan7/2**23 - 1) * (100000 / xarm)  
+      Ey = -(chan6/2**23 - 1) * (100000 / yarm)
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channels "chan0", "chan1", etc.
+        metadata (dict): Contains "xarm" and "yarm".
+    
+    Returns:
+        pd.DataFrame: DataFrame with new columns "Bx", "Bz", "By", "Ex", and "Ey".
+    """
+    divisor = 10**7
+    df["Bx"] = (df["chan0"].astype(float) / divisor) * 70000.0
+    df["Bz"] = (df["chan1"].astype(float) / divisor) * 70000.0
+    df["By"] = -(df["chan2"].astype(float) / divisor) * 70000.0
+    xarm = metadata.get("xarm", 1.0)
+    yarm = metadata.get("yarm", 1.0)
+    df["Ex"] = -(df["chan7"].astype(float) / xarm)
+    df["Ey"] = -(df["chan6"].astype(float) / yarm)
+    return df
+
+
+def rotate_data(df, metadata):
+    """Rotates horizontal magnetic (and optionally electric) fields.
+    
+    Computes angle_avg = mean(arctan2(By, Bx)) and rotates the horizontal fields.
+    If metadata["erotate"] == 1, the electric fields are also rotated.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with "Bx", "By", "Bz", "Ex", "Ey".
+        metadata (dict): Contains "erotate".
+    
+    Returns:
+        pd.DataFrame: DataFrame with rotated fields ("Hx", "Dx", "Z_rot", and optionally "Ex_rot", "Ey_rot").
+    """
+    angles = np.arctan2(df["By"].values, df["Bx"].values)
+    angle_avg = np.mean(angles)
+    write_log(f"Computed rotation angle: {np.degrees(angle_avg):.2f} degrees")
+
+    df["Hx"] = df["Bx"] * np.cos(angle_avg) + df["By"] * np.sin(angle_avg)
+    df["Dx"] = df["By"] * np.cos(angle_avg) - df["Bx"] * np.sin(angle_avg)
+    df["Z_rot"] = df["Bz"]
+
+    if metadata.get("erotate", 0) == 1:
+        df["Ex_rot"] = df["Ex"] * np.cos(angle_avg) + df["Ey"] * np.sin(angle_avg)
+        df["Ey_rot"] = df["Ey"] * np.cos(angle_avg) - df["Ex"] * np.sin(angle_avg)
+    else:
+        df["Ex_rot"] = df["Ex"]
+        df["Ey_rot"] = df["Ey"]
+    return df
+
+def tilt_correction(df, include_remote_reference=False):
+    """Applies tilt correction to make mean(By) = 0.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with Bx, By columns
+        include_remote_reference (bool): Whether to also apply tilt correction to rBx, rBy channels
+        
+    Returns:
+        tuple: (corrected_df, tilt_angle_degrees)
+    """
+    df_corrected = df.copy()
+    tilt_angle_degrees = 0.0
+    
+    # Calculate tilt angle from main channels
+    if 'Bx' in df_corrected.columns and 'By' in df_corrected.columns:
+        tilt_angle = np.arctan2(df_corrected['By'].mean(), df_corrected['Bx'].mean())
+        tilt_angle_degrees = np.degrees(tilt_angle)
+        
+        # Apply rotation to main channels
+        Bx_rot = df_corrected['Bx'] * np.cos(-tilt_angle) - df_corrected['By'] * np.sin(-tilt_angle)
+        By_rot = df_corrected['Bx'] * np.sin(-tilt_angle) + df_corrected['By'] * np.cos(-tilt_angle)
+        
+        df_corrected['Bx'] = Bx_rot
+        df_corrected['By'] = By_rot
+        
+        write_log(f"Applied tilt correction to main channels: {tilt_angle_degrees:.2f} degrees")
+    
+    # Apply tilt correction to remote reference channels if requested and available
+    if include_remote_reference and 'rBx' in df_corrected.columns and 'rBy' in df_corrected.columns:
+        # Calculate separate tilt angle for remote reference channels using their means
+        remote_tilt_angle = np.arctan2(df_corrected['rBy'].mean(), df_corrected['rBx'].mean())
+        remote_tilt_angle_degrees = np.degrees(remote_tilt_angle)
+        
+        # Apply rotation to remote reference channels using their own tilt angle
+        rBx_rot = df_corrected['rBx'] * np.cos(-remote_tilt_angle) - df_corrected['rBy'] * np.sin(-remote_tilt_angle)
+        rBy_rot = df_corrected['rBx'] * np.sin(-remote_tilt_angle) + df_corrected['rBy'] * np.cos(-remote_tilt_angle)
+        
+        df_corrected['rBx'] = rBx_rot
+        df_corrected['rBy'] = rBy_rot
+        
+        write_log(f"Applied tilt correction to remote reference channels: {remote_tilt_angle_degrees:.2f} degrees")
+    
+    return df_corrected, tilt_angle_degrees
+
+def log_summary_stats(df, label="Summary"):
+    """Logs summary statistics for magnetic fields and derived fields.
+
+    Computes mean and standard deviation for Bx, By, Bz, total magnetic field,
+    and horizontal magnetic field.
+
+    Args:
+        df (pd.DataFrame): DataFrame with "Bx", "By", "Bz".
+        label (str): Label for the statistics (e.g., "Before tilt correction").
+
+    Returns:
+        None
+    """
+    mean_Bx = df["Bx"].mean()
+    std_Bx = df["Bx"].std()
+    mean_By = df["By"].mean()
+    std_By = df["By"].std()
+    mean_Bz = df["Bz"].mean()
+    std_Bz = df["Bz"].std()
+    B_total = np.sqrt(df["Bx"]**2 + df["By"]**2 + df["Bz"]**2)
+    mean_B_total = B_total.mean()
+    std_B_total = B_total.std()
+    B_horizontal = np.sqrt(df["Bx"]**2 + df["By"]**2)
+    mean_B_horizontal = B_horizontal.mean()
+    std_B_horizontal = B_horizontal.std()
+
+    stats_text = (
+        f"{label}:\n"
+        f"  Bx: mean = {mean_Bx:.2f}, std = {std_Bx:.2f}\n"
+        f"  By: mean = {mean_By:.2f}, std = {std_By:.2f}\n"
+        f"  Bz: mean = {mean_Bz:.2f}, std = {std_Bz:.2f}\n"
+        f"  Total B: mean = {mean_B_total:.2f}, std = {std_B_total:.2f}\n"
+        f"  Horizontal B: mean = {mean_B_horizontal:.2f}, std = {std_B_horizontal:.2f}"
+    )
+    write_log(stats_text)
+
+### Smoothing Functions: Only Median/MAD and Adaptive Median Filtering are retained ###
+
+def smooth_outlier_points(df, channels=["Bx", "By", "Bz", "Ex", "Ey"], window=50, threshold=3.0):
+    """Applies outlier detection and smoothing using rolling median and MAD.
+    
+    Outliers are detected and then interpolated linearly.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with measurement channels.
+        channels (list, optional): Channels to process. Defaults to ["Bx", "By", "Bz", "Ex", "Ey"].
+        window (int, optional): Rolling window size. Defaults to 50.
+        threshold (float, optional): Multiplier for MAD. Defaults to 3.0.
+    
+    Returns:
+        tuple: (df, outlier_info) where outlier_info maps channels to outlier intervals.
+    """
+    outlier_info = {}
+    for ch in channels:
+        mask = detect_outliers(df[ch], window=window, threshold=threshold)
+        intervals = get_intervals_from_mask(mask, df["time"])
+        outlier_info[ch] = intervals
+        df[ch] = smooth_outliers(df[ch], mask)
+    return df, outlier_info
+
+
+def detect_outliers(series, window=50, threshold=3.0):
+    """Detects outliers using a rolling median and MAD approach.
+    
+    Args:
+        series (pd.Series): Input time-series.
+        window (int, optional): Rolling window size. Defaults to 50.
+        threshold (float, optional): Multiplier for MAD. Defaults to 3.0.
+    
+    Returns:
+        pd.Series: Boolean Series marking outliers.
+    """
+    rolling_median = series.rolling(window=window, center=True, min_periods=1).median()
+    abs_diff = (series - rolling_median).abs()
+    rolling_mad = abs_diff.rolling(window=window, center=True, min_periods=1).median()
+    rolling_mad = rolling_mad.replace(0, 1e-6)
+    return abs_diff > threshold * rolling_mad
+
+
+def smooth_outliers(series, outlier_mask):
+    """Interpolates linearly over regions marked as outliers.
+    
+    Args:
+        series (pd.Series): Input time-series.
+        outlier_mask (pd.Series): Boolean mask indicating outliers.
+    
+    Returns:
+        pd.Series: Smoothed series.
+    """
+    series_clean = series.copy()
+    series_clean[outlier_mask] = np.nan
+    return series_clean.interpolate(method="linear")
+
+
+def get_intervals_from_mask(mask, time_values):
+    """Extracts (start_time, end_time) intervals where the mask is True.
+    
+    Args:
+        mask (pd.Series): Boolean mask from outlier detection.
+        time_values (pd.Series): Corresponding time values.
+    
+    Returns:
+        list: List of tuples (start_time, end_time).
+    """
+    intervals = []
+    in_interval = False
+    start_time = None
+    for i, flag in enumerate(mask):
+        if flag and not in_interval:
+            in_interval = True
+            start_time = time_values.iloc[i]
+        elif not flag and in_interval:
+            intervals.append((start_time, time_values.iloc[i - 1]))
+            in_interval = False
+    if in_interval:
+        intervals.append((start_time, time_values.iloc[-1]))
+    return intervals
+
+
+def smooth_median_mad(df, channels=["Bx", "By", "Bz", "Ex", "Ey"], window=50, threshold=3.0):
+    """Wrapper for the median/MAD smoothing method.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with measurement channels.
+        channels (list, optional): Channels to smooth. Defaults to ["Bx", "By", "Bz", "Ex", "Ey"].
+        window (int, optional): Rolling window size. Defaults to 50.
+        threshold (float, optional): Multiplier for MAD. Defaults to 3.0.
+    
+    Returns:
+        tuple: (df, outlier_info)
+    """
+    return smooth_outlier_points(df, channels=channels, window=window, threshold=threshold)
+
+
+def smooth_adaptive_median(signal, min_window=51, max_window=2500, threshold=10.0):
+    """Applies an adaptive median filter to a 1D numpy array.
+    
+    For each sample, starts with a window of size min_window (odd) and expands until the sample
+    is within threshold * MAD of the median or until max_window is reached.
+    
+    Args:
+        signal (np.ndarray): Input 1D array.
+        min_window (int, optional): Minimum window size (odd). Defaults to 51.
+        max_window (int, optional): Maximum window size (odd). Defaults to 2500.
+        threshold (float, optional): Threshold multiplier for MAD. Defaults to 10.0.
+    
+    Returns:
+        np.ndarray: Smoothed array.
+    """
+    smoothed = np.copy(signal)
+    n = len(signal)
+    if min_window % 2 == 0:
+        min_window += 1
+    if max_window % 2 == 0:
+        max_window += 1
+
+    for i in range(n):
+        window_size = min_window
+        smoothed_value = signal[i]
+        while window_size <= max_window:
+            half_window = window_size // 2
+            start = max(0, i - half_window)
+            end = min(n, i + half_window + 1)
+            window = signal[start:end]
+            med = np.median(window)
+            mad = np.median(np.abs(window - med))
+            if mad == 0:
+                mad = 1e-6
+            if np.abs(signal[i] - med) <= threshold * mad:
+                smoothed_value = med
+                break
+            window_size += 2
+        smoothed[i] = smoothed_value
+    return smoothed
+
+
+def smooth_adaptive(df, channels=["Bx", "By", "Bz", "Ex", "Ey"], min_window=3, max_window=2500, threshold=10.0):
+    """Applies adaptive median filtering to specified channels of a DataFrame.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with a 'time' column and measurement channels.
+        channels (list, optional): Channels to smooth. Defaults to ["Bx", "By", "Bz", "Ex", "Ey"].
+        min_window (int, optional): Minimum window size (odd). Defaults to 3.
+        max_window (int, optional): Maximum window size (odd). Defaults to 2500.
+        threshold (float, optional): Threshold multiplier for MAD. Defaults to 10.0.
+    
+    Returns:
+        tuple: (df_adapt, {})
+    """
+    df_adapt = df.copy()
+    for ch in channels:
+        data = df_adapt[ch].values
+        df_adapt[ch] = smooth_adaptive_median(data, min_window=min_window, max_window=max_window, threshold=threshold)
+    return df_adapt, {}
+
+
+### Plotting Functions ###
+
+def plot_power_spectra(df, channels, fs, nperseg=1024, save_plots=False, site_name="UnknownSite", output_dir="."):
+    """Plots power spectra for specified channels.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data.
+        channels (list): List of channel names to plot.
+        fs (float): Sampling frequency.
+        nperseg (int): Number of points per segment for FFT.
+        save_plots (bool): Whether to save plots to files.
+        site_name (str): Site name for plot titles and filenames.
+        output_dir (str): Directory to save plots in.
+    """
+    try:
+        fig, axes = plt.subplots(len(channels), 1, figsize=(12, 3*len(channels)))
+        if len(channels) == 1:
+            axes = [axes]
+        
+        for i, channel in enumerate(channels):
+            if channel in df.columns:
+                data = df[channel].dropna()
+                if len(data) > 0:
+                    f, Pxx = welch(data, fs=fs, nperseg=min(nperseg, len(data)//2))
+                    axes[i].semilogy(f, Pxx)
+                    axes[i].set_xlabel('Frequency [Hz]')
+                    axes[i].set_ylabel('Power Spectral Density')
+                    axes[i].set_title(f'{channel} - {site_name}')
+                    axes[i].grid(True)
+                else:
+                    axes[i].text(0.5, 0.5, f'No data for {channel}', ha='center', va='center', transform=axes[i].transAxes)
+            else:
+                axes[i].text(0.5, 0.5, f'Channel {channel} not found', ha='center', va='center', transform=axes[i].transAxes)
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_power_spectra.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Power spectra plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_power_spectra: {e}", level="ERROR")
+
+
+def plot_coherence_plots(df, fs, nperseg=1024, save_plots=False, site_name="UnknownSite", output_dir="."):
+    """Plots coherence between MT-specific channel pairs.
+    
+    Standard MT pairs: Bx-Ey, By-Ex
+    Remote reference pairs (if available): Bx-rBx, By-rBy, Ex-rEx, Ey-rEy
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data.
+        fs (float): Sampling frequency.
+        nperseg (int): Number of points per segment for FFT.
+        save_plots (bool): Whether to save plots to files.
+        site_name (str): Site name for plot titles and filenames.
+        output_dir (str): Directory to save plots in.
+    """
+    try:
+        # Define MT-specific coherence pairs
+        pairs = []
+        
+        # Standard MT pairs
+        if 'Bx' in df.columns and 'Ey' in df.columns:
+            pairs.append(('Bx', 'Ey'))
+        if 'By' in df.columns and 'Ex' in df.columns:
+            pairs.append(('By', 'Ex'))
+        
+        # Remote reference pairs (if available)
+        if 'rBx' in df.columns:
+            if 'Bx' in df.columns:
+                pairs.append(('Bx', 'rBx'))
+            if 'Ex' in df.columns:
+                pairs.append(('Ex', 'rEx'))
+        if 'rBy' in df.columns:
+            if 'By' in df.columns:
+                pairs.append(('By', 'rBy'))
+            if 'Ey' in df.columns:
+                pairs.append(('Ey', 'rEy'))
+        
+        # Additional cross-coherence pairs for remote reference
+        if 'rBx' in df.columns and 'Ey' in df.columns:
+            pairs.append(('rBx', 'Ey'))
+        if 'rBy' in df.columns and 'Ex' in df.columns:
+            pairs.append(('rBy', 'Ex'))
+        
+        if not pairs:
+            write_log(f"No valid coherence pairs found for {site_name}", level="WARNING")
+            return
+        
+        fig, axes = plt.subplots(len(pairs), 1, figsize=(12, 3*len(pairs)))
+        if len(pairs) == 1:
+            axes = [axes]
+        
+        for i, (ch1, ch2) in enumerate(pairs):
+            if ch1 in df.columns and ch2 in df.columns:
+                data1 = df[ch1].dropna()
+                data2 = df[ch2].dropna()
+                if len(data1) > 0 and len(data2) > 0:
+                    # Ensure both channels have the same length
+                    min_len = min(len(data1), len(data2))
+                    data1 = data1[:min_len]
+                    data2 = data2[:min_len]
+                    
+                    f, Cxy = coherence(data1, data2, fs=fs, nperseg=min(nperseg, min_len//2))
+                    axes[i].plot(f, Cxy)
+                    axes[i].set_xlabel('Frequency [Hz]')
+                    axes[i].set_ylabel('Coherence')
+                    axes[i].set_title(f'{ch1}-{ch2} Coherence - {site_name}')
+                    axes[i].grid(True)
+                    axes[i].set_ylim(0, 1)
+                else:
+                    axes[i].text(0.5, 0.5, f'No data for {ch1}-{ch2}', ha='center', va='center', transform=axes[i].transAxes)
+            else:
+                missing = []
+                if ch1 not in df.columns:
+                    missing.append(ch1)
+                if ch2 not in df.columns:
+                    missing.append(ch2)
+                axes[i].text(0.5, 0.5, f'Channels not found: {missing}', ha='center', va='center', transform=axes[i].transAxes)
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_coherence.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Coherence plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_coherence_plots: {e}", level="ERROR")
+
+
+def plot_physical_channels(df, boundaries=None, plot_boundaries=True,
+                           smoothed_intervals=None, plot_smoothed_windows=True,
+                           tilt_corrected=False, save_plots=False, site_name="UnknownSite", output_dir=".",
+                           drift_corrected=False, rotated=False, plot_tilt=False, plot_original_data=False,
+                           gps_data=None, tilt_angle_degrees=None, remote_gps_data=None, distance_km=None,
+                           remote_reference_site=None, xarm=None, yarm=None, skip_minutes=[0, 0], timezone="UTC"):
+    """Plots physical channel data in subplots.
+    
+    Since tilt correction overwrites the original 'Bx' and 'By' columns,
+    this function always uses "Bx", "By", etc.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with measurement channels.
+        boundaries (list): List of time values for file boundaries.
+        plot_boundaries (bool): Whether to draw vertical lines at boundaries.
+        smoothed_intervals (dict): Dictionary of smoothed window intervals.
+        plot_smoothed_windows (bool): Whether to shade smoothed windows.
+        tilt_corrected (bool): For labeling purposes (unused in column mapping).
+        save_plots (bool): If True, saves the figure; otherwise displays it.
+        site_name (str): Site name used for naming the saved file.
+        output_dir (str, optional): Directory to save plots. Defaults to current directory.
+        drift_corrected (bool): Whether drift correction was applied.
+        rotated (bool): Whether rotation was applied.
+        plot_tilt (bool): Whether to plot tilt-corrected data in timeseries (default: False).
+        plot_original_data (bool): Whether to plot original data alongside corrected data (default: False).
+        gps_data (dict, optional): Dictionary containing GPS coordinates and altitude.
+        tilt_angle_degrees (float, optional): Tilt angle in degrees for tilt-corrected data.
+        remote_gps_data (dict, optional): GPS data from remote reference site.
+        distance_km (float, optional): Distance between main and remote sites in km.
+        remote_reference_site (str, optional): Name of the remote reference site.
+        xarm (float, optional): X dipole length in meters.
+        yarm (float, optional): Y dipole length in meters.
+        skip_minutes (list): Minutes to skip from start and end of data (e.g., [30, 20] skips first 30 and last 20 minutes).
+        timezone (str): Timezone for the data.
+    
+    Returns:
+        None
+    """
+    # Determine which channels to plot based on what corrections were applied
+    if rotated and 'Hx' in df.columns and 'Dx' in df.columns:
+        # Use rotated channels if available
+        channel_mapping = {"Hx": "Hx", "Dx": "Dx", "Z_rot": "Z_rot", "Ex_rot": "Ex_rot", "Ey_rot": "Ey_rot"}
+        h_field = np.sqrt(df['Hx']**2 + df['Dx']**2) if all(col in df.columns for col in ['Hx', 'Dx']) else None
+    else:
+        # Use standard channels
+        channel_mapping = {"Bx": "Bx", "By": "By", "Bz": "Bz", "Ex": "Ex", "Ey": "Ey"}
+        h_field = np.sqrt(df['Bx']**2 + df['By']**2) if all(col in df.columns for col in ['Bx', 'By']) else None
+
+    # Add remote reference channels if present
+    remote_tilt_angle = None
+    if 'rBx' in df.columns and 'rBy' in df.columns:
+        channel_mapping.update({"rBx": "rBx", "rBy": "rBy"})
+        write_log(f"Adding remote reference channels (rBx, rBy) to plot")
+        
+        # Check if remote reference channels were tilt-corrected
+        if 'rBx_original' in df.columns and 'rBy_original' in df.columns:
+            # Calculate remote reference tilt angle using rBy and rBx means
+            rBy_mean = df['rBy_original'].mean()
+            rBx_mean = df['rBx_original'].mean()
+            remote_tilt_angle = np.arctan2(rBy_mean, rBx_mean) * 180 / np.pi
+            write_log(f"Remote reference tilt correction angle (from rBy/rBx means): {remote_tilt_angle:.2f}°")
+
+    # Calculate total field strength for magnetic channels
+    total_field_strength = None
+    if 'Bx' in df.columns and 'By' in df.columns and 'Bz' in df.columns:
+        total_field_strength = np.sqrt(df['Bx']**2 + df['By']**2 + df['Bz']**2)
+    elif 'Hx' in df.columns and 'Dx' in df.columns and 'Z_rot' in df.columns:
+        total_field_strength = np.sqrt(df['Hx']**2 + df['Dx']**2 + df['Z_rot']**2)
+
+    # Dynamically adjust figure size based on number of channels
+    num_channels = len(channel_mapping)
+    fig_height = max(12, num_channels * 2.5)  # At least 12 inches, 2.5 inches per channel
+    fig, axes = plt.subplots(num_channels, 1, figsize=(14, fig_height), sharex=True)
+    
+    # Handle case where there's only one channel (axes becomes a single object, not an array)
+    if num_channels == 1:
+        axes = [axes]
+    
+    # Create main title
+    main_title = f"Time Series for {site_name}"
+    if remote_reference_site:
+        main_title += f" with Remote Reference {remote_reference_site}"
+    fig.suptitle(main_title, fontsize=16, fontweight='bold', y=0.98)
+    
+    # Determine x-axis data
+    if "datetime" in df.columns:
+        x_data = df["datetime"]
+        # Get timezone abbreviation for x-axis label
+        tz_str = timezone[0] if isinstance(timezone, list) else timezone
+        tz_abbrev = get_timezone_abbreviation(tz_str)
+        x_label = f"Time ({tz_abbrev})"
+    else:
+        x_data = df["time"]
+        x_label = "Time (seconds)"
+    
+    # Prepare text boxes content
+    left_text = []
+    right_text = []
+    center_text = []
+    
+    # GPS coordinates on the left
+    if gps_data:
+        if gps_data.get("latitude") is not None:
+            left_text.append(f"Latitude: {gps_data['latitude']:.6f}°")
+        if gps_data.get("longitude") is not None:
+            left_text.append(f"Longitude: {gps_data['longitude']:.6f}°")
+        if gps_data.get("altitude") is not None:
+            left_text.append(f"Altitude: {gps_data['altitude']} m")
+    
+    # Field strengths on the right
+    if h_field is not None:
+        h_mean = h_field.mean()
+        h_std = h_field.std()
+        right_text.append(f"Horizontal Magnetic Field: {h_mean:.2f} ± {h_std:.2f} nT")
+    if total_field_strength is not None:
+        total_mean = total_field_strength.mean()
+        total_std = total_field_strength.std()
+        right_text.append(f"Total Magnetic Field: {total_mean:.2f} ± {total_std:.2f} nT")
+    
+    # Distance to remote reference in the center
+    if distance_km is not None:
+        center_text.append(f"Distance to Remote Reference: {distance_km:.2f} km")
+    
+    # Tilt correction angles in the center
+    if tilt_angle_degrees is not None:
+        center_text.append(f"Main Site Tilt: {tilt_angle_degrees:.2f}°")
+    if remote_tilt_angle is not None:
+        center_text.append(f"Remote Reference Tilt: {remote_tilt_angle:.2f}°")
+    
+    # Add text boxes closer to the subplots to minimize white space
+    text_y_position = 0.96  # Position below title but close to subplots
+    if left_text:
+        fig.text(0.02, text_y_position, '\n'.join(left_text), fontsize=9, 
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="lightgray", alpha=0.8),
+                verticalalignment='top')
+    
+    if right_text:
+        fig.text(0.98, text_y_position, '\n'.join(right_text), fontsize=9, 
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="lightblue", alpha=0.8),
+                verticalalignment='top', horizontalalignment='right')
+    
+    if center_text:
+        fig.text(0.5, text_y_position, '\n'.join(center_text), fontsize=9, 
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="lightgreen", alpha=0.8),
+                verticalalignment='top', horizontalalignment='center')
+    
+    for ax, (label, col) in zip(axes, channel_mapping.items()):
+        if col in df.columns:
+            # Set subplot title with dipole length for Ex/Ey
+            if col in ["Ex", "Ey", "Ex_rot", "Ey_rot"]:
+                dipole_length = xarm if col in ["Ex", "Ex_rot"] else yarm
+                if dipole_length:
+                    ax.set_title(f"{label} ({dipole_length:.1f} m)", fontsize=12, fontweight='bold')
+                else:
+                    ax.set_title(label, fontsize=12, fontweight='bold')
+            else:
+                ax.set_title(label, fontsize=12, fontweight='bold')
+            
+            # For Bx and By, if plot_tilt is enabled, plot tilt-corrected data by default
+            if plot_tilt and col in ["Bx", "By"] and f"{col}_original" in df.columns:
+                # Always plot tilt-corrected data when plot_tilt is enabled
+                ax.plot(x_data, df[col], label=f"{col} (tilt-corrected)", color='blue', linewidth=1.5)
+                tilt_mean = df[col].mean()
+                ax.axhline(tilt_mean, color='blue', linestyle='-', alpha=0.5, label=f"Mean ({col} tilt-corrected) = {tilt_mean:.2f}")
+                
+                # Only plot original data if plot_original_data is also enabled
+                if plot_original_data:
+                    ax.plot(x_data, df[f"{col}_original"], label=f"{col} (original)", color='gray', alpha=0.7)
+                    orig_mean = df[f"{col}_original"].mean()
+                    ax.axhline(orig_mean, color='gray', linestyle=':', label=f"Mean ({col} original) = {orig_mean:.2f}")
+            
+            # For remote reference channels, handle tilt correction similarly with different colors
+            elif plot_tilt and col in ["rBx", "rBy"] and f"{col}_original" in df.columns:
+                # Plot tilt-corrected remote reference data with different color (purple)
+                ax.plot(x_data, df[col], label=f"{col} (tilt-corrected)", color='purple', linewidth=1.5)
+                tilt_mean = df[col].mean()
+                ax.axhline(tilt_mean, color='purple', linestyle='-', alpha=0.5, label=f"Mean ({col} tilt-corrected) = {tilt_mean:.2f}")
+                
+                # Only plot original data if plot_original_data is also enabled
+                if plot_original_data:
+                    ax.plot(x_data, df[f"{col}_original"], label=f"{col} (original)", color='orange', alpha=0.7)
+                    orig_mean = df[f"{col}_original"].mean()
+                    ax.axhline(orig_mean, color='orange', linestyle=':', label=f"Mean ({col} original) = {orig_mean:.2f}")
+            
+            # For remote reference channels without tilt correction, use different color
+            elif col in ["rBx", "rBy"]:
+                # Plot remote reference data with different color (purple)
+                ax.plot(x_data, df[col], label=col, color='purple', linewidth=1.5)
+                mean_val = df[col].mean()
+                ax.axhline(mean_val, color='purple', linestyle='-', alpha=0.5, label=f"Mean = {mean_val:.2f}")
+            
+            else:
+                # Standard plotting for all other channels (including Bz, Ex, Ey when plot_tilt is enabled)
+                # If plot_original_data is enabled and we have original columns, plot them
+                if plot_original_data and f"{col}_original" in df.columns:
+                    ax.plot(x_data, df[f"{col}_original"], label=f"{col} (original)", color='gray', alpha=0.7)
+                    orig_mean = df[f"{col}_original"].mean()
+                    ax.axhline(orig_mean, color='gray', linestyle=':', label=f"Mean ({col} original) = {orig_mean:.2f}")
+                
+                # Plot the main data
+                ax.plot(x_data, df[col], label=col, alpha=0.7)
+                mean_val = df[col].mean()
+                ax.axhline(mean_val, color='black', linestyle=':', label=f"Mean = {mean_val:.2f}")
+            
+            # Set y-axis label
+            if col in ["Bx", "By", "Bz", "Hx", "Dx", "Z_rot", "rBx", "rBy"]:
+                ax.set_ylabel("Magnetic Field (nT)", fontsize=10)
+            elif col in ["Ex", "Ey", "Ex_rot", "Ey_rot"]:
+                ax.set_ylabel("Electric Field (mV/km)", fontsize=10)
+            else:
+                ax.set_ylabel(col, fontsize=10)
+            
+            # Add legend
+            ax.legend(loc='upper right', fontsize=8)
+            
+            # Format x-axis for datetime
+            if "datetime" in df.columns:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+                ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Set x-axis limits to show full data width with no blank spots
+            if len(x_data) > 0:
+                ax.set_xlim(x_data.min(), x_data.max())
+                
+                # Add visual indicators for trimmed data regions if skip_minutes was used
+                if skip_minutes[0] > 0 or skip_minutes[1] > 0:
+                    # Calculate the original data range that was trimmed
+                    if "datetime" in df.columns:
+                        # For datetime data, we need to estimate the trimmed regions
+                        # Since we don't have the original data, we'll show the current range
+                        # and add dashed lines at the boundaries
+                        current_start = x_data.min()
+                        current_end = x_data.max()
+                        
+                        # Add dashed lines to indicate trimmed regions
+                        if skip_minutes[0] > 0:
+                            # Add dashed line at the start to indicate data was trimmed
+                            ax.axvline(current_start, color='red', linestyle='--', alpha=0.7, linewidth=2, 
+                                     label=f'Start (trimmed {skip_minutes[0]} min)')
+                        
+                        if skip_minutes[1] > 0:
+                            # Add dashed line at the end to indicate data was trimmed
+                            ax.axvline(current_end, color='red', linestyle='--', alpha=0.7, linewidth=2,
+                                     label=f'End (trimmed {skip_minutes[1]} min)')
+                    else:
+                        # For time-based data, we can be more precise
+                        if skip_minutes[0] > 0:
+                            skip_seconds_start = skip_minutes[0] * 60
+                            ax.axvline(skip_seconds_start, color='red', linestyle='--', alpha=0.7, linewidth=2,
+                                     label=f'Start (trimmed {skip_minutes[0]} min)')
+                        
+                        if skip_minutes[1] > 0:
+                            skip_seconds_end = x_data.max() - (skip_minutes[1] * 60)
+                            ax.axvline(skip_seconds_end, color='red', linestyle='--', alpha=0.7, linewidth=2,
+                                     label=f'End (trimmed {skip_minutes[1]} min)')
+    
+    # Set x-axis label on the last subplot only
+    if len(axes) > 0:
+        axes[-1].set_xlabel(x_label, fontsize=12)
+    
+    # Adjust layout to minimize white space
+    plt.tight_layout(pad=0.5, h_pad=0.3, w_pad=0.3, rect=(0, 0, 1, 0.95))
+    
+    # Add year annotation inline with the Time axis title
+    if "datetime" in df.columns and len(df) > 0:
+        last_ax = axes[-1]
+        last_year = df["datetime"].iloc[-1].year
+        # Position the year annotation at the same y-level as the x-axis label
+        xlabel_pos = last_ax.get_xlabel()
+        if xlabel_pos:
+            # Get the position of the x-axis label and place year annotation nearby
+            last_ax.annotate(f"({last_year})", xy=(0.98, -0.15), xycoords="axes fraction", 
+                            fontsize=10, ha="right", va="top", color="gray",
+                            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+    
+    if save_plots:
+        filename = os.path.join(output_dir, f"{site_name}_physical_channels.png")
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        write_log(f"Physical channels plot saved as {filename}")
+    else:
+        plt.show()
+
+
+def extract_datetime_from_filename(filename):
+    """Extracts datetime from EDL filename format.
+    
+    Filename format: EDL_YYMMDDHHMMSS.CHANNEL
+    Example: EDL_041020190000.BX -> 2004-10-20 19:00:00
+    
+    Args:
+        filename (str): EDL filename
+        
+    Returns:
+        datetime.datetime: Extracted datetime object
+    """
+    try:
+        # Extract the timestamp part after underscore and before dot
+        timestamp_part = filename.split('_')[1].split('.')[0]
+        
+        # Parse YYMMDDHHMMSS format
+        year = 2000 + int(timestamp_part[0:2])  # Assume 20xx for YY
+        month = int(timestamp_part[2:4])
+        day = int(timestamp_part[4:6])
+        hour = int(timestamp_part[6:8])
+        minute = int(timestamp_part[8:10])
+        second = int(timestamp_part[10:12])
+        
+        return datetime.datetime(year, month, day, hour, minute, second)
+    except (IndexError, ValueError) as e:
+        write_log(f"Error parsing datetime from filename {filename}: {e}", level="ERROR")
+        return None
+
+
+def extract_gps_coordinates(gps_file_path):
+    """Extracts GPS coordinates from EDL GPS file.
+    
+    GPS Message Format:
+    AL (Altitude) message: >RAL[GPS_time][Altitude][Vertical_Velocity][Source][Age];*[checksum]<
+    - GPS_time: 5 digits (e.g., 08057)
+    - Altitude: 6 digits with sign (e.g., +00083)
+    - Vertical_Velocity: 5 digits with sign (e.g., +000)
+    - Source: 1 digit (1 = 3D GPS)
+    - Age: 1 digit (2 = Fresh)
+    
+    PV (Position Velocity) message: >RPV[GPS_time][Latitude][Longitude][Speed][Heading][Source][Age];*[checksum]<
+    - GPS_time: 5 digits (e.g., 08057)
+    - Latitude: 8 digits with sign (e.g., -3497172) - divide by 100000 for decimal degrees
+    - Longitude: 9 digits with sign (e.g., +13948378) - divide by 100000 for decimal degrees
+    - Speed: 3 digits (e.g., 000)
+    - Heading: 3 digits (e.g., 000)
+    - Source: 1 digit (1 = 3D GPS)
+    - Age: 1 digit (2 = Fresh)
+    
+    Args:
+        gps_file_path (str): Path to the GPS file
+        
+    Returns:
+        dict: Dictionary containing latitude, longitude, and altitude
+    """
+    gps_data = {}
+    try:
+        with open(gps_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if not line or not line.startswith('>R'):
+                continue
+            # Remove leading '>' and trailing '<' if present
+            if line.startswith('>'):
+                line = line[1:]
+            if line.endswith('<'):
+                line = line[:-1]
+            # Split at ';' to remove checksum
+            line = line.split(';')[0]
+            
+            # AL message: >RAL[GPS_time][Altitude][Vertical_Velocity][Source][Age]
+            if line.startswith('RAL'):
+                try:
+                    # Extract altitude: positions 8-13 (after RAL + 5-digit GPS time)
+                    # Format: RAL00017+00085+00012
+                    #        01234567890123456789
+                    altitude_str = line[8:14]  # +00085 (after RAL + 5 digits)
+                    gps_data['altitude'] = float(altitude_str)
+                    write_log(f"Extracted altitude: {gps_data['altitude']} m")
+                except Exception as e:
+                    write_log(f"Error parsing altitude from line '{line}': {e}", level="WARNING")
+            
+            # PV message: >RPV[GPS_time][Latitude][Longitude][Speed][Heading][Source][Age]
+            elif line.startswith('RPV'):
+                try:
+                    # Extract latitude: positions 8-15 (after RPV + 5-digit GPS time)
+                    # Format: RPV00017-3497176+1394837700000012
+                    #        012345678901234567890123456789
+                    lat_str = line[8:16]   # -3497176 (after RPV + 5 digits)
+                    # Extract longitude: positions 16-25 (9 digits)
+                    lon_str = line[16:25]  # +13948377 (9 digits)
+                    
+                    gps_data['latitude'] = float(lat_str) / 100000.0
+                    gps_data['longitude'] = float(lon_str) / 100000.0
+                    write_log(f"Extracted coordinates: Lat={gps_data['latitude']:.6f}°, Lon={gps_data['longitude']:.6f}°")
+                except Exception as e:
+                    write_log(f"Error parsing coordinates from line '{line}': {e}", level="WARNING")
+        
+        return gps_data
+    except FileNotFoundError:
+        write_log(f"GPS file not found: {gps_file_path}", level="WARNING")
+        return gps_data
+    except Exception as e:
+        write_log(f"Error reading GPS file {gps_file_path}: {e}", level="ERROR")
+        return gps_data
+
+
+def find_gps_file(input_dir, station_identifier=None):
+    """Finds the first GPS file in the input directory or its subdirectories.
+    
+    Uses the station_long_identifier from recorder.ini to find GPS files with the correct naming pattern.
+    GPS files follow the pattern: {station_identifier}YYMMDDHHMMSS.gps
+    
+    Args:
+        input_dir (str): Input directory to search
+        station_identifier (str): Station identifier from recorder.ini (e.g., 'EDL_', 'EDL03_', 'EDL04_')
+        
+    Returns:
+        str: Path to the first GPS file found, or None if not found
+    """
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if file.endswith('.gps'):
+                # If we have the station identifier, use it to find the correct GPS file
+                if station_identifier and file.startswith(station_identifier):
+                    write_log(f"Found GPS file with station identifier '{station_identifier}': {file}")
+                    return os.path.join(root, file)
+                # Fallback: check if the file has a timestamp pattern (YYMMDDHHMMSS) after an underscore
+                elif '_' in file:
+                    parts = file.split('_')
+                    if len(parts) >= 2:
+                        timestamp_part = parts[-1].replace('.gps', '')
+                        if len(timestamp_part) == 12 and timestamp_part.isdigit():
+                            write_log(f"Found GPS file with timestamp pattern: {file}")
+                            return os.path.join(root, file)
+                elif 'EDL_' in file:
+                    write_log(f"Found GPS file with EDL_ pattern: {file}")
+                    return os.path.join(root, file)
+    
+    # If no GPS file found with specific patterns, log the expected pattern
+    if station_identifier:
+        write_log(f"No GPS file found with expected pattern: {station_identifier}*.gps in {input_dir}", level="WARNING")
+    
+    # Fallback: look for any .gps file
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if file.endswith('.gps'):
+                write_log(f"Found GPS file (fallback): {file}")
+                return os.path.join(root, file)
+    
+    # If still not found, log a warning
+    write_log(f"No GPS file found in {input_dir}", level="WARNING")
+    return None
+
+
+def calculate_distance_between_sites(gps1, gps2):
+    """Calculate the distance between two GPS coordinates using the Haversine formula.
+    
+    Args:
+        gps1 (dict): GPS data for first site with 'latitude' and 'longitude' keys
+        gps2 (dict): GPS data for second site with 'latitude' and 'longitude' keys
+        
+    Returns:
+        float: Distance in kilometers
+    """
+    try:
+        lat1 = gps1.get('latitude')
+        lon1 = gps1.get('longitude')
+        lat2 = gps2.get('latitude')
+        lon2 = gps2.get('longitude')
+        
+        if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+            return None
+        
+        # Convert decimal degrees to radians
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        
+        # Radius of earth in kilometers
+        r = 6371
+        
+        return c * r
+        
+    except Exception as e:
+        write_log(f"Error calculating distance between sites: {e}", level="WARNING")
+        return None
+
+
+def load_remote_reference_data(remote_site, remote_site_dir, start_datetime, end_datetime, sample_interval, main_site_gps=None, timezone="UTC"):
+    """Loads remote reference data (Bx, By) from the specified remote site.
+    
+    Args:
+        remote_site (str): Name of the remote reference site
+        remote_site_dir (str): Directory containing the remote site data
+        start_datetime (datetime): Start datetime for the main site
+        end_datetime (datetime): End datetime for the main site
+        sample_interval (float): Sample interval in seconds
+        main_site_gps (dict, optional): GPS data from main site for distance calculation
+        timezone (str): Timezone for the remote reference data
+        
+    Returns:
+        tuple: (DataFrame with datetime, rBx, rBy columns, remote GPS data dict, distance float)
+    """
+    try:
+        write_log(f"Loading remote reference data from {remote_site}")
+        
+        # Map site names to their correct station identifiers
+        site_to_station_map = {
+            'HDD5449': 'EDL_',      # No number
+            'HDD5456': 'EDL04_',    # EDL04
+            'HDD5470': 'EDL03_',    # EDL03  
+            'HDD5974': 'EDL01_'     # EDL01
+        }
+        
+        # Get the correct station identifier for this site
+        station_identifier = site_to_station_map.get(remote_site, 'EDL_')
+        write_log(f"Using station identifier '{station_identifier}' for remote site {remote_site}")
+        
+        # Load remote reference GPS data
+        remote_gps_data = None
+        distance_km = None
+        
+        try:
+            remote_gps_file_path = find_gps_file(remote_site_dir, station_identifier)
+            if remote_gps_file_path:
+                write_log(f"Found remote GPS file: {remote_gps_file_path}")
+                remote_gps_data = extract_gps_coordinates(remote_gps_file_path)
+                if remote_gps_data and main_site_gps:
+                    # Calculate distance between sites
+                    distance_km = calculate_distance_between_sites(main_site_gps, remote_gps_data)
+                    write_log(f"Distance between {remote_site} and main site: {distance_km:.2f} km")
+                elif remote_gps_data:
+                    write_log(f"Remote GPS data loaded for {remote_site}, but no main site GPS for distance calculation")
+            else:
+                write_log(f"No GPS file found for remote site {remote_site}")
+        except Exception as e:
+            write_log(f"Error loading remote GPS data: {e}", level="WARNING")
+        
+        # Use ASCIIReader to read only BX and BY channels from remote site
+        dummy_outfile = io.StringIO()
+        remote_metadata = {
+            'sample_interval': sample_interval,
+            'station_long_identifier': station_identifier
+        }
+        
+        data_reader = ASCIIReader(remote_site_dir, remote_metadata, average=False, log_first_rows=False)
+        # Load only BX and BY channels for remote reference
+        remote_df = data_reader.read_specific_channels(['BX', 'BY'], dummy_outfile)
+        
+        if remote_df.empty:
+            write_log(f"No remote reference data found for {remote_site}", level="WARNING")
+            return None, None, None
+        
+        # Convert to physical units (we only need Bx, By)
+        divisor = 10**7
+        remote_df["rBx"] = (remote_df["BX"].astype(float) / divisor) * 70000.0
+        remote_df["rBy"] = -(remote_df["BY"].astype(float) / divisor) * 70000.0
+        
+        # Build datetime column for remote data
+        # Find the first BX file to extract start time using the same logic as ASCIIReader
+        pattern = os.path.join(remote_site_dir, "**", f"{station_identifier}*.BX")
+        bx_files = glob.glob(pattern, recursive=True)
+        
+        if not bx_files:
+            write_log(f"No BX files found in remote site {remote_site}", level="WARNING")
+            return None, None, None
+        
+        # Sort files to get the earliest one
+        bx_files.sort()
+        first_bx_file = os.path.basename(bx_files[0])
+        write_log(f"Remote reference using first file: {first_bx_file}")
+        
+        remote_start_datetime = extract_datetime_from_filename(first_bx_file)
+        if remote_start_datetime:
+            # Apply GPS week rollover correction if needed (same logic as main site)
+            original_time = remote_start_datetime
+            if remote_start_datetime.year < 2020:  # Likely GPS week rollover issue
+                gps_week_rollover = datetime.timedelta(weeks=1024)  # 19.7 years
+                remote_start_datetime = remote_start_datetime + gps_week_rollover
+                write_log(f"Remote GPS week rollover correction applied:")
+                write_log(f"  Original (wrong): {original_time}")
+                write_log(f"  Corrected (actual): {remote_start_datetime}")
+                write_log(f"  Correction: +{gps_week_rollover.days} days ({gps_week_rollover.days * 24} hours)")
+            
+            time_seconds = np.arange(len(remote_df)) * sample_interval
+            remote_df["datetime"] = [remote_start_datetime + datetime.timedelta(seconds=s) for s in time_seconds]
+            
+            # Apply timezone conversion if requested
+            if timezone != "UTC":
+                try:
+                    import pytz
+                    utc_tz = pytz.UTC
+                    target_tz = pytz.timezone(timezone)
+                    remote_df["datetime"] = remote_df["datetime"].dt.tz_localize(utc_tz).dt.tz_convert(target_tz)
+                    write_log(f"Applied timezone '{timezone}' to remote reference data")
+                except ImportError:
+                    write_log(f"pytz not available, using UTC timezone for remote reference", level="WARNING")
+                except Exception as e:
+                    write_log(f"Error converting remote reference timezone: {e}, using UTC", level="WARNING")
+            
+            write_log(f"Remote reference data loaded: {len(remote_df)} samples from {remote_start_datetime} to {remote_df['datetime'].iloc[-1]}")
+            write_log(f"Main site time range: {start_datetime} to {end_datetime}")
+            write_log(f"Remote site time range: {remote_df['datetime'].min()} to {remote_df['datetime'].max()}")
+            
+            # For remote reference, we don't need to filter to exact time range
+            # The merge function will handle alignment with tolerance
+            # Just keep the columns we need
+            result_df = remote_df[['datetime', 'rBx', 'rBy']].copy()
+            write_log(f"Remote reference data prepared: {len(result_df)} samples")
+            
+            return result_df, remote_gps_data, distance_km
+        else:
+            write_log(f"Could not extract start time from remote site {remote_site} file {first_bx_file}", level="WARNING")
+            return None, None, None
+            
+    except Exception as e:
+        write_log(f"Error loading remote reference data from {remote_site}: {e}", level="ERROR")
+        return None, None, None
+
+
+def merge_with_remote_reference(main_df, remote_df, tolerance_seconds=1.0):
+    """Merges main site data with remote reference data based on datetime matching.
+    
+    Args:
+        main_df (pd.DataFrame): Main site data with datetime column
+        remote_df (pd.DataFrame): Remote reference data with datetime column
+        tolerance_seconds (float): Time tolerance for matching in seconds
+        
+    Returns:
+        pd.DataFrame: Merged dataframe with 7 columns (Bx, By, Bz, Ex, Ey, rBx, rBy)
+    """
+    try:
+        write_log("Merging main site data with remote reference data")
+        
+        if remote_df is None or remote_df.empty:
+            write_log("No remote reference data available, returning main site data only", level="WARNING")
+            return main_df
+        
+        # Ensure both dataframes have datetime as index for merging
+        main_copy = main_df.copy()
+        remote_copy = remote_df.copy()
+        
+        # Set datetime as index for both dataframes
+        main_copy.set_index('datetime', inplace=True)
+        remote_copy.set_index('datetime', inplace=True)
+        
+        # Use merge_asof if available, otherwise use merge with tolerance
+        try:
+            # Try merge_asof (pandas >= 0.19.0)
+            merged_df = main_copy.merge_asof(
+                remote_copy, 
+                left_index=True, 
+                right_index=True,
+                tolerance=pd.Timedelta(seconds=tolerance_seconds),
+                direction='nearest'
+            )
+        except AttributeError:
+            # Fallback for older pandas versions - use merge with tolerance
+            write_log("merge_asof not available, using standard merge with tolerance", level="WARNING")
+            
+            # Reset index to get datetime as column for standard merge
+            main_copy.reset_index(inplace=True)
+            remote_copy.reset_index(inplace=True)
+            
+            # Merge on datetime with tolerance
+            merged_df = pd.merge_asof(
+                main_copy, 
+                remote_copy, 
+                on='datetime',
+                tolerance=None,
+                direction='nearest'
+            )
+            
+            # Set datetime back as index
+            merged_df.set_index('datetime', inplace=True)
+        
+        # Reset index to get datetime back as a column
+        merged_df.reset_index(inplace=True)
+        
+        # Check for missing remote reference data
+        missing_remote = merged_df['rBx'].isnull().sum()
+        total_samples = len(merged_df)
+        
+        if missing_remote > 0:
+            write_log(f"WARNING: {missing_remote}/{total_samples} samples missing remote reference data", level="WARNING")
+        
+        write_log(f"Successfully merged data: {len(merged_df)} samples with remote reference")
+        write_log(f"Final columns: {list(merged_df.columns)}")
+        
+        return merged_df
+        
+    except Exception as e:
+        write_log(f"Error merging with remote reference: {e}", level="ERROR")
+        return main_df
+
+
+class ProcessASCII:
+    """Processes ASCII EDL magnetotelluric data files for a given site.
+    
+    Reads metadata, loads ASCII files (.BX, .BY, .BZ, .EX, .EY) from day folders,
+    concatenates raw data, applies corrections (drift, rotation, tilt), optional smoothing,
+    generates plots (or saves them), and saves raw and processed outputs.
+    Output files and plots are named using the site name (derived from the input directory).
+    """
+    
+    def __init__(self, input_dir, param_file, average=False, perform_freq_analysis=False,
+                 plot_data=False, apply_smoothing=False, smoothing_window=2500, threshold_factor=10.0,
+                 plot_boundaries=True, plot_smoothed_windows=True, plot_coherence=False,
+                 log_first_rows=False, smoothing_method="median", sens_start=0, sens_end=5000,
+                 skip_minutes=[0, 0], apply_drift_correction=False, apply_rotation=False,
+                 plot_drift=False, plot_rotation=False, plot_tilt=False, timezone="UTC", plot_original_data=False,
+                 save_raw_data=False, save_processed_data=False, remote_reference=None):
+        """
+        Initialize the ProcessASCII class.
+        
+        Args:
+            input_dir (str): Directory containing the ASCII data files.
+            param_file (str): Path to the parameter file (config/recorder.ini).
+            average (bool): Whether to average the data (unused).
+            perform_freq_analysis (bool): Whether to perform frequency analysis.
+            plot_data (bool): Whether to plot the data.
+            apply_smoothing (bool): Whether to apply smoothing.
+            smoothing_window (int): Window size for smoothing.
+            threshold_factor (float): Threshold factor for outlier detection.
+            plot_boundaries (bool): Whether to plot file boundaries.
+            plot_smoothed_windows (bool): Whether to plot smoothed windows.
+            plot_coherence (bool): Whether to plot coherence.
+            log_first_rows (bool): Whether to log the first few rows.
+            smoothing_method (str): Smoothing method ("median" or "adaptive").
+            sens_start (int): Start sample for sensitivity test (unused).
+            sens_end (int): End sample for sensitivity test (unused).
+            skip_minutes (list): Minutes to skip from start and end of data (e.g., [30, 20] skips first 30 and last 20 minutes).
+            apply_drift_correction (bool): Whether to apply drift correction.
+            apply_rotation (bool): Whether to apply rotation.
+            plot_drift (bool): Whether to plot drift correction.
+            plot_rotation (bool): Whether to plot rotation.
+            plot_tilt (bool): Whether to plot tilt correction.
+            timezone (str): Timezone for the data.
+            plot_original_data (bool): Whether to plot original data.
+            save_raw_data (bool): Whether to save raw data.
+            save_processed_data (bool): Whether to save processed data.
+            remote_reference (str, optional): Remote reference site name.
+        """
+        self.input_dir = input_dir
+        self.param_file = param_file
+        self.average = average
+        self.perform_freq_analysis = perform_freq_analysis
+        self.plot_data = plot_data
+        self.apply_smoothing = apply_smoothing
+        self.smoothing_window = smoothing_window
+        self.threshold_factor = threshold_factor
+        self.plot_boundaries = plot_boundaries
+        self.plot_smoothed_windows = plot_smoothed_windows
+        self.plot_coherence = plot_coherence
+        self.log_first_rows = log_first_rows
+        self.smoothing_method = smoothing_method
+        self.sens_start = sens_start
+        self.sens_end = sens_end
+        self.skip_minutes = skip_minutes
+        self.apply_drift_correction = apply_drift_correction
+        self.apply_rotation = apply_rotation
+        self.plot_drift = plot_drift
+        self.plot_rotation = plot_rotation
+        self.plot_tilt = plot_tilt
+        self.timezone = timezone
+        self.plot_original_data = plot_original_data
+        self.save_raw_data = save_raw_data
+        self.save_processed_data = save_processed_data
+        self.remote_reference = remote_reference
+        
+        # Extract site name from input directory
+        self.site_name = os.path.basename(os.path.abspath(input_dir))
+        set_site_name(self.site_name)
+        
+        # Create output directory
+        self.output_dir = os.path.join("outputs", self.site_name)
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Initialize results tracking
+        self.results = {
+            'status': 'INITIALIZED',
+            'data_shape': None,
+            'error': None,
+            'start_time': datetime.datetime.now(),
+            'end_time': None
+        }
+        
+        # Read Processing.txt configuration
+        self.processing_config = read_processing_config()
+        
+        # Read site metadata
+        self.metadata = self.read_metadata()
+        
+        # Override dipole lengths with Processing.txt values if available
+        if self.site_name in self.processing_config:
+            site_config = self.processing_config[self.site_name]
+            self.metadata['xarm'] = site_config['xarm']
+            self.metadata['yarm'] = site_config['yarm']
+            write_site_log(f"Using Processing.txt config: xarm={site_config['xarm']} m, yarm={site_config['yarm']}")
+        else:
+            write_site_log(f"No Processing.txt config found, using default metadata", level="WARNING")
+        
+        self.tilt_correction = False  # Set via command-line.
+        self.save_plots = False   # Set via command-line.
+        self.decimation_factor = 1  # Default to no decimation
+        self.run_lemimt = False  # Set via command-line
+        self.lemimt_path = "lemimt.exe"  # Set via command-line
+
+    def read_metadata(self):
+        """Reads metadata from the recorder.ini file in the input directory.
+        
+        Returns:
+            dict: Metadata dictionary.
+        """
+        metadata = {}
+        try:
+            config_file_path = os.path.join(self.input_dir, self.param_file)
+            config = configparser.ConfigParser()
+            config.read(config_file_path)
+            
+            # Extract basic station information
+            recorder_section = config['recorder']
+            metadata['station_long_identifier'] = recorder_section.get('station_long_identifier', 'EDL_')
+            metadata['station_short_identifier'] = recorder_section.get('station_short_identifier', 'edl_')
+            
+            # Extract channel information
+            channels = {}
+            for i in range(22):  # Check for channels 0-21
+                long_id_key = f'channel_{i}_long_id'
+                short_id_key = f'channel_{i}_short_id'
+                samplerate_key = f'channel_{i}_samplerate'
+                format_key = f'channel_{i}_format'
+                
+                if long_id_key in recorder_section:
+                    channels[i] = {
+                        'long_id': recorder_section[long_id_key],
+                        'short_id': recorder_section.get(short_id_key, ''),
+                        'samplerate': int(recorder_section.get(samplerate_key, 0)),
+                        'format': recorder_section.get(format_key, 'ascii')
+                    }
+            
+            metadata['channels'] = channels
+            
+            # Get sample rate for the main channels (BX, BY, BZ, EX, EY)
+            main_channels = ['BX', 'BY', 'BZ', 'EX', 'EY']
+            sample_rates = []
+            for channel_info in channels.values():
+                if channel_info['long_id'] in main_channels and channel_info['samplerate'] > 0:
+                    sample_rates.append(channel_info['samplerate'])
+            
+            if sample_rates:
+                metadata['sample_interval'] = 1.0 / sample_rates[0]  # Use first non-zero sample rate
+            else:
+                metadata['sample_interval'] = 0.1  # Default to 10 Hz if not found
+            
+            # Set default values for processing parameters
+            metadata['xarm'] = 100.0  # Default dipole length in meters
+            metadata['yarm'] = 100.0  # Default dipole length in meters
+            metadata['erotate'] = 1   # Default to enable rotation
+            metadata['time_drift'] = 0  # Default no time drift
+            
+            # Set default start and finish times (will be updated based on actual data)
+            current_time = datetime.datetime.now()
+            metadata['start_time'] = {
+                'day': current_time.day,
+                'month': current_time.month, 
+                'year': current_time.year,
+                'hour': current_time.hour,
+                'minute': current_time.minute,
+                'second': current_time.second
+            }
+            metadata['finish_time'] = metadata['start_time'].copy()
+            
+            write_log(f"[{self.site_name}] Metadata successfully loaded from {config_file_path}")
+            write_log(f"[{self.site_name}] Sample interval: {metadata['sample_interval']} seconds")
+            write_log(f"[{self.site_name}] Active channels: {[ch['long_id'] for ch in channels.values() if ch['samplerate'] > 0]}")
+            
+        except Exception as e:
+            write_log(f"[{self.site_name}] Error reading metadata file {self.param_file} from {self.input_dir}: {e}", level="ERROR")
+            # Set minimal default metadata
+            metadata = {
+                'sample_interval': 0.1,
+                'xarm': 100.0,
+                'yarm': 100.0,
+                'erotate': 1,
+                'time_drift': 0,
+                'channels': {}
+            }
+        return metadata
+
+    def process_all_files(self):
+        """Process all ASCII files in the input directory."""
+        try:
+            self.results['status'] = 'PROCESSING'
+            write_site_log(f"Processing site: {self.site_name}")
+            
+            # Extract GPS coordinates
+            gps_file_path = find_gps_file(self.input_dir, self.site_name)
+            gps_data = None
+            if gps_file_path:
+                write_site_log(f"Found GPS file: {gps_file_path}")
+                gps_data = extract_gps_coordinates(gps_file_path)
+                if gps_data:
+                    gps_info = []
+                    if 'latitude' in gps_data and 'longitude' in gps_data:
+                        gps_info.append(f"Lat: {gps_data['latitude']:.6f}°")
+                        gps_info.append(f"Lon: {gps_data['longitude']:.6f}°")
+                    if 'altitude' in gps_data:
+                        gps_info.append(f"Alt: {gps_data['altitude']:.1f} m")
+                    if gps_info:
+                        write_site_log(f"GPS coordinates for {self.site_name}: {', '.join(gps_info)}")
+                    else:
+                        write_site_log(f"No valid GPS coordinates found for {self.site_name}")
+                else:
+                    write_site_log(f"Failed to extract GPS coordinates for {self.site_name}")
+            else:
+                write_site_log(f"No GPS file found for {self.site_name}")
+            
+            # Load ASCII data
+            reader = ASCIIReader(self.input_dir, self.metadata, self.average, self.log_first_rows)
+            combined_raw_df = reader.read_all_data(io.StringIO())
+            
+            if combined_raw_df is None or combined_raw_df.empty:
+                write_site_log("No ASCII data files found to process.", level="ERROR")
+                self.results['status'] = 'FAILED'
+                self.results['error'] = 'No data files found'
+                return
+            
+            write_site_log(f"All ASCII files loaded and concatenated successfully")
+            write_site_log(f"Data shape: {combined_raw_df.shape}")
+            write_site_log(f"Data columns: {list(combined_raw_df.columns)}")
+            
+            # Check for NaN values
+            n_nans = combined_raw_df.isnull().sum().sum()
+            if n_nans > 0:
+                write_site_log(f"WARNING: Found {n_nans} NaN values in raw data", level="WARNING")
+            
+            # Save raw data if requested
+            if self.save_raw_data:
+                raw_output_path = os.path.join(self.output_dir, f"{self.site_name}_output_raw.txt")
+                combined_raw_df.to_csv(raw_output_path, index=False, sep='\t')
+                write_site_log(f"Raw data saved to {raw_output_path}")
+            else:
+                write_site_log(f"Skipping saving raw data (not requested)")
+            
+            # Build time column
+            sample_interval = self.metadata.get('sample_interval', 1.0)
+            write_site_log(f"Building time column with sample_interval: {sample_interval}")
+            
+            # Find first file to extract start time
+            station_identifier = self.metadata.get('station_long_identifier', 'EDL_')
+            bx_files = glob.glob(os.path.join(self.input_dir, "**", f"{station_identifier}*.BX"), recursive=True)
+            if not bx_files:
+                bx_files = glob.glob(os.path.join(self.input_dir, "**", "*.BX"), recursive=True)
+            
+            if bx_files:
+                first_file = sorted(bx_files)[0]
+                write_site_log(f"Using first file: {first_file}")
+                
+                # Extract start time from filename
+                start_datetime = extract_datetime_from_filename(os.path.basename(first_file))
+                
+                if start_datetime:
+                    write_site_log(f"Extracted start time from filename: {start_datetime}")
+                    
+                    # Apply GPS week rollover correction if needed
+                    original_time = start_datetime
+                    if start_datetime.year < 2020:  # Likely GPS week rollover issue
+                        gps_week_rollover = datetime.timedelta(weeks=1024)  # 19.7 years
+                        start_datetime = start_datetime + gps_week_rollover
+                        write_site_log(f"GPS week rollover correction applied:")
+                        write_site_log(f"  Original (wrong): {original_time}")
+                        write_site_log(f"  Corrected (actual): {start_datetime}")
+                        write_site_log(f"  Correction: +{gps_week_rollover.days} days ({gps_week_rollover.days * 24} hours)")
+                    
+                    # Convert timezone if requested
+                    if self.timezone[0] != "UTC":
+                        try:
+                            import pytz
+                            utc_tz = pytz.UTC
+                            target_tz = pytz.timezone(self.timezone[0])
+                            start_datetime = utc_tz.localize(start_datetime).astimezone(target_tz)
+                            write_site_log(f"Converted start time to {self.timezone[0]}: {start_datetime}")
+                        except ImportError:
+                            write_site_log(f"pytz not available, using UTC timezone", level="WARNING")
+                        except Exception as e:
+                            write_site_log(f"Error converting timezone: {e}, using UTC", level="WARNING")
+                    
+                    # Build datetime column
+                    combined_raw_df['datetime'] = [
+                        start_datetime + datetime.timedelta(seconds=i * sample_interval)
+                        for i in range(len(combined_raw_df))
+                    ]
+                    write_site_log(f"Built datetime column from {start_datetime} to {combined_raw_df['datetime'].iloc[-1]}")
+                else:
+                    write_site_log(f"Failed to extract datetime from filename, using simple time column", level="WARNING")
+                    combined_raw_df['datetime'] = [
+                        datetime.datetime.now() + datetime.timedelta(seconds=i * sample_interval)
+                        for i in range(len(combined_raw_df))
+                    ]
+            else:
+                write_site_log(f"No BX files found with pattern '{station_identifier}*.BX', using simple time column", level="WARNING")
+                combined_raw_df['datetime'] = [
+                    datetime.datetime.now() + datetime.timedelta(seconds=i * sample_interval)
+                    for i in range(len(combined_raw_df))
+                ]
+            
+            # Skip minutes if requested (after datetime column is built)
+            if self.skip_minutes[0] > 0:
+                skip_timedelta = datetime.timedelta(minutes=self.skip_minutes[0])
+                original_start = combined_raw_df['datetime'].min()
+                new_start = original_start + skip_timedelta
+                combined_raw_df = combined_raw_df[combined_raw_df['datetime'] >= new_start]
+                write_site_log(f"Skipping first {self.skip_minutes[0]} minutes (from {original_start} to {new_start})")
+                write_site_log(f"Data shape after skipping start: {combined_raw_df.shape}")
+            
+            if self.skip_minutes[1] > 0:
+                skip_timedelta = datetime.timedelta(minutes=self.skip_minutes[1])
+                original_end = combined_raw_df['datetime'].max()
+                new_end = original_end - skip_timedelta
+                combined_raw_df = combined_raw_df[combined_raw_df['datetime'] <= new_end]
+                write_site_log(f"Skipping last {self.skip_minutes[1]} minutes (from {new_end} to {original_end})")
+                write_site_log(f"Data shape after skipping end: {combined_raw_df.shape}")
+            
+            # Convert to physical units
+            write_site_log(f"Converting ASCII data from raw counts to physical units...")
+            processed_df = self.convert_ascii_to_physical_units(combined_raw_df)
+            write_site_log(f"ASCII data converted from raw counts to physical units.")
+            write_site_log(f"Processed data shape: {processed_df.shape}")
+            
+            # Check for NaN values after conversion
+            n_nans = processed_df.isnull().sum().sum()
+            if n_nans > 0:
+                write_site_log(f"WARNING: Found {n_nans} NaN values after conversion", level="WARNING")
+            
+            # Load remote reference data if requested
+            if self.remote_reference:
+                write_site_log(f"Starting remote reference processing with {self.remote_reference}")
+                remote_ref_site = self.remote_reference
+                remote_ref_dir = os.path.join(os.path.dirname(self.input_dir), remote_ref_site)
+                
+                # Determine timezone for remote reference
+                remote_timezone = self.timezone[1] if len(self.timezone) > 1 else self.timezone[0]
+                write_site_log(f"Using timezone '{remote_timezone}' for remote reference site")
+                
+                if os.path.exists(remote_ref_dir):
+                    remote_df, remote_gps_data, distance_km = load_remote_reference_data(
+                        remote_ref_site, remote_ref_dir, 
+                        processed_df['datetime'].min(), processed_df['datetime'].max(),
+                        sample_interval, gps_data, remote_timezone
+                    )
+                    
+                    if remote_df is not None and not remote_df.empty:
+                        # Ensure both datasets have the same timezone before merging
+                        if len(self.timezone) > 1 and self.timezone[0] != self.timezone[1]:
+                            # Convert remote reference to main site timezone
+                            try:
+                                import pytz
+                                remote_tz = pytz.timezone(remote_timezone)
+                                main_tz = pytz.timezone(self.timezone[0])
+                                remote_df['datetime'] = remote_df['datetime'].dt.tz_localize(remote_tz).dt.tz_convert(main_tz)
+                                write_site_log(f"Converted remote reference timezone from {remote_timezone} to {self.timezone[0]}")
+                            except Exception as e:
+                                write_site_log(f"Error converting remote reference timezone: {e}", level="WARNING")
+                        
+                        processed_df = merge_with_remote_reference(processed_df, remote_df)
+                        if 'rBx' in processed_df.columns:
+                            write_site_log(f"Remote reference data merged successfully")
+                        else:
+                            write_site_log(f"Remote reference merge failed - no rBx column found", level="WARNING")
+                    else:
+                        write_site_log(f"No remote reference data available", level="WARNING")
+                else:
+                    write_site_log(f"Remote reference directory not found: {remote_ref_dir}", level="WARNING")
+            
+            # Apply decimation if requested
+            if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                write_site_log(f"Applying decimation factor: {self.decimation_factor}")
+                processed_df, sample_interval = decimate_dataframe(processed_df, self.decimation_factor, sample_interval)
+                write_site_log(f"Decimation applied. New sample interval: {sample_interval:.3f}s")
+            
+            # Preserve original columns before tilt correction if plotting tilt
+            if self.plot_tilt:
+                if 'Bx' in processed_df.columns:
+                    processed_df['Bx_original'] = processed_df['Bx'].copy()
+                if 'By' in processed_df.columns:
+                    processed_df['By_original'] = processed_df['By'].copy()
+                if 'rBx' in processed_df.columns:
+                    processed_df['rBx_original'] = processed_df['rBx'].copy()
+                if 'rBy' in processed_df.columns:
+                    processed_df['rBy_original'] = processed_df['rBy'].copy()
+
+            # Generate processing config file
+            if gps_data:
+                has_remote = self.remote_reference is not None
+                
+                # Add sample rate suffix to site name if decimation is applied
+                site_name_for_config = self.site_name
+                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                    suffix = get_sample_rate_suffix(sample_interval)
+                    site_name_for_config = f"{self.site_name}{suffix}"
+                
+                config_path = generate_processing_config(
+                    site_name_for_config, 
+                    gps_data, 
+                    sample_interval, 
+                    has_remote_reference=has_remote,
+                    remote_reference_site=self.remote_reference,
+                    output_dir=self.output_dir
+                )
+                write_site_log(f"Generated processing config file: {config_path}")
+            
+            # Apply tilt correction
+            tilt_angle_degrees = None
+            remote_tilt_angle = None
+            if self.tilt_correction:
+                write_site_log(f"Applying tilt correction...")
+                include_remote = self.tilt_correction == "RR" and 'rBx' in processed_df.columns and 'rBy' in processed_df.columns
+                processed_df, tilt_angle_degrees = tilt_correction(processed_df, include_remote_reference=include_remote)
+                
+                # Extract remote tilt angle if available
+                if include_remote and 'rBx' in processed_df.columns and 'rBy' in processed_df.columns:
+                    remote_tilt_angle = np.degrees(np.arctan2(processed_df['rBy'].mean(), processed_df['rBx'].mean()))
+                    write_site_log(f"Applied tilt correction to remote reference channels: {remote_tilt_angle:.2f} degrees")
+                
+                write_site_log(f"Applied tilt correction to main channels: {tilt_angle_degrees:.2f} degrees")
+                write_site_log(f"Tilt correction applied successfully: {tilt_angle_degrees:.2f} degrees")
+            
+            # Apply smoothing if requested
+            if self.apply_smoothing:
+                write_site_log(f"Applying {self.smoothing_method} smoothing...")
+                if self.smoothing_method == "median":
+                    processed_df, _ = smooth_median_mad(processed_df, window=self.smoothing_window, threshold=self.threshold_factor)
+                elif self.smoothing_method == "adaptive":
+                    processed_df, _ = smooth_adaptive(processed_df, min_window=3, max_window=self.smoothing_window, threshold=self.threshold_factor)
+                write_site_log(f"Smoothing applied successfully")
+            
+            # Save processed data if requested
+            if self.save_processed_data:
+                # Prepare output data - only include channel columns (no datetime)
+                output_columns = []
+                
+                # Add channel columns based on what's available
+                if self.apply_rotation and 'Hx' in processed_df.columns:
+                    output_columns.extend(['Hx', 'Dx', 'Z_rot'])
+                    if 'Ex_rot' in processed_df.columns:
+                        output_columns.extend(['Ex_rot', 'Ey_rot'])
+                else:
+                    output_columns.extend(['Bx', 'By', 'Bz'])
+                    if 'Ex' in processed_df.columns:
+                        output_columns.extend(['Ex', 'Ey'])
+                
+                # Add remote reference channels if available
+                if 'rBx' in processed_df.columns:
+                    output_columns.extend(['rBx', 'rBy'])
+                
+                output_df = processed_df[output_columns].copy()
+                
+                # Add sample rate suffix to filename for all decimation factors
+                suffix = get_sample_rate_suffix(sample_interval)
+                filename = f"{self.site_name}{suffix}_output_processed.txt"
+                processed_output_path = os.path.join(self.output_dir, filename)
+                # Save with three decimal places for all float columns, no headers
+                float_cols = output_df.select_dtypes(include=['float', 'float64', 'float32']).columns
+                output_df[float_cols] = output_df[float_cols].round(3)
+                output_df.to_csv(processed_output_path, index=False, header=False, sep='\t', float_format='%.3f')
+                write_site_log(f"Processed data saved to {processed_output_path}")
+            else:
+                write_site_log(f"Skipping saving processed data (not requested)")
+            
+            # Update results
+            self.results['data_shape'] = processed_df.shape
+            self.results['status'] = 'SUCCESS'
+            self.results['end_time'] = datetime.datetime.now()
+            
+            # Generate plots if requested
+            if self.plot_data:
+                write_site_log(f"Generating plots...")
+                
+                # Get sample rate suffix for plotting
+                suffix = ""
+                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                    suffix = get_sample_rate_suffix(sample_interval)
+                
+                site_name_for_plot = f"{self.site_name}{suffix}"
+                plot_physical_channels(
+                    processed_df, 
+                    plot_boundaries=self.plot_boundaries,
+                    plot_smoothed_windows=self.plot_smoothed_windows,
+                    tilt_corrected=self.tilt_correction,
+                    save_plots=self.save_plots,
+                    site_name=site_name_for_plot,
+                    output_dir=self.output_dir,
+                    drift_corrected=self.apply_drift_correction,
+                    rotated=self.apply_rotation,
+                    plot_tilt=self.plot_tilt,
+                    plot_original_data=self.plot_original_data,
+                    gps_data=gps_data,
+                    tilt_angle_degrees=tilt_angle_degrees,
+                    remote_reference_site=self.remote_reference,
+                    xarm=self.metadata.get("xarm"),
+                    yarm=self.metadata.get("yarm"),
+                    skip_minutes=self.skip_minutes,
+                    timezone=self.timezone
+                )
+                write_site_log(f"Plots generated successfully")
+            
+            # Perform frequency analysis if requested
+            if self.perform_freq_analysis:
+                write_site_log(f"Performing frequency analysis...")
+                
+                # Add sample rate suffix to site name if decimation is applied
+                site_name_for_freq = self.site_name
+                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                    suffix = get_sample_rate_suffix(sample_interval)
+                    site_name_for_freq = f"{self.site_name}{suffix}"
+                
+                self.frequency_analysis(processed_df, site_name_for_freq)
+                write_site_log(f"Frequency analysis completed")
+            
+            # Plot coherence if requested
+            if self.plot_coherence:
+                write_site_log(f"Generating coherence plots...")
+                
+                # Add sample rate suffix to site name if decimation is applied
+                site_name_for_coherence = self.site_name
+                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                    suffix = get_sample_rate_suffix(sample_interval)
+                    site_name_for_coherence = f"{self.site_name}{suffix}"
+                
+                plot_coherence_plots(
+                    processed_df, 
+                    fs=1.0/sample_interval,
+                    save_plots=self.save_plots,
+                    site_name=site_name_for_coherence,
+                    output_dir=self.output_dir
+                )
+                write_site_log(f"Coherence plots generated successfully")
+            
+            write_site_log(f"Processing completed successfully for {self.site_name}")
+            
+        except Exception as e:
+            error_msg = f"Error processing {self.site_name}: {e}"
+            write_site_log(error_msg, level="ERROR")
+            write_site_log(f"Traceback: {traceback.format_exc()}", level="ERROR")
+            self.results['status'] = 'FAILED'
+            self.results['error'] = str(e)
+            self.results['end_time'] = datetime.datetime.now()
+            raise
+
+    def convert_ascii_to_physical_units(self, df):
+        """Converts ASCII data from raw counts into physical units.
+        
+        Magnetics:
+          Bx = (BX/10^7) * 70000  
+          Bz = (BZ/10^7) * 70000  
+          By = -(BY/10^7) * 70000  
+        Electrics:
+          Ex = -(EX / xarm)  
+          Ey = -(EY / yarm)
+        
+        Args:
+            df (pd.DataFrame): DataFrame with ASCII columns "BX", "BY", "BZ", "EX", "EY".
+            metadata (dict): Contains "xarm" and "yarm".
+        
+        Returns:
+            pd.DataFrame: DataFrame with converted physical units in "Bx", "By", "Bz", "Ex", "Ey".
+        """
+        divisor = 10**7
+        xarm = self.metadata.get("xarm", 100.0)
+        yarm = self.metadata.get("yarm", 100.0)
+        
+        # Convert magnetic fields
+        df["Bx"] = (df["BX"].astype(float) / divisor) * 70000.0
+        df["Bz"] = (df["BZ"].astype(float) / divisor) * 70000.0
+        df["By"] = -(df["BY"].astype(float) / divisor) * 70000.0
+        
+        # Convert electric fields
+        df["Ex"] = -(df["EX"].astype(float) / xarm)
+        df["Ey"] = -(df["EY"].astype(float) / yarm)
+        
+        # Remove original columns
+        df = df.drop(columns=["BX", "BY", "BZ", "EX", "EY"])
+        
+        return df
+
+    def frequency_analysis(self, df, identifier):
+        """Performs frequency analysis on the processed data.
+        
+        Args:
+            df (pd.DataFrame): Processed DataFrame.
+            identifier (str): Identifier for the analysis.
+        """
+        try:
+            sample_interval = self.metadata["sample_interval"]
+            fs = 1.0 / sample_interval
+            
+            # Determine which channels to analyze
+            channels = []
+            if 'Bx' in df.columns:
+                channels.append('Bx')
+            if 'By' in df.columns:
+                channels.append('By')
+            if 'Bz' in df.columns:
+                channels.append('Bz')
+            if 'Ex' in df.columns:
+                channels.append('Ex')
+            if 'Ey' in df.columns:
+                channels.append('Ey')
+            
+            # Add remote reference channels if available
+            if 'rBx' in df.columns:
+                channels.append('rBx')
+            if 'rBy' in df.columns:
+                channels.append('rBy')
+            
+            if not channels:
+                write_log(f"No channels available for frequency analysis for {identifier}", level="WARNING")
+                return
+            
+            # Parse frequency analysis options
+            freq_options = self.perform_freq_analysis.upper() if isinstance(self.perform_freq_analysis, str) else "W"
+            
+            # Perform requested frequency analysis methods
+            if 'W' in freq_options:
+                write_log(f"Performing Welch spectral analysis for {identifier}")
+                plot_welch_spectra(df, channels, fs, 
+                                  save_plots=self.save_plots, 
+                                  site_name=identifier, 
+                                  output_dir=self.output_dir)
+            
+            if 'M' in freq_options:
+                write_log(f"Performing Multi-taper spectral analysis for {identifier}")
+                plot_multitaper_spectra(df, channels, fs, 
+                                       save_plots=self.save_plots, 
+                                       site_name=identifier, 
+                                       output_dir=self.output_dir)
+            
+            if 'S' in freq_options:
+                write_log(f"Performing Spectrogram analysis for {identifier}")
+                plot_spectrograms(df, channels, fs, 
+                                 save_plots=self.save_plots, 
+                                 site_name=identifier, 
+                                 output_dir=self.output_dir)
+            
+            write_log(f"Frequency analysis completed for {identifier} (methods: {freq_options})")
+            
+        except Exception as e:
+            write_log(f"Error in frequency analysis for {identifier}: {e}", level="ERROR")
+
+    def run_lemimt_processing(self, processed_file_path):
+        """Run lemimt.exe on the processed output file.
+        
+        Args:
+            processed_file_path (str): Path to the processed output file
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            import platform
+            import subprocess
+            
+            # Check if we're on Windows
+            if platform.system() != "Windows":
+                write_site_log(f"lemimt.exe can only run on Windows. Current platform: {platform.system()}", level="WARNING")
+                write_site_log(f"To run lemimt processing, transfer the file {processed_file_path} to a Windows machine", level="INFO")
+                write_site_log(f"Command to run on Windows: {self.lemimt_path} -r -f {processed_file_path}", level="INFO")
+                return False
+            
+            # Check if lemimt.exe exists
+            if not os.path.exists(self.lemimt_path):
+                write_site_log(f"lemimt.exe not found at: {self.lemimt_path}", level="ERROR")
+                return False
+            
+            # Check if processed file exists
+            if not os.path.exists(processed_file_path):
+                write_site_log(f"Processed file not found: {processed_file_path}", level="ERROR")
+                return False
+            
+            # Construct the command
+            cmd = [self.lemimt_path, "-r", "-f", os.path.abspath(processed_file_path)]
+            write_site_log(f"Running lemimt command: {' '.join(cmd)}")
+            
+            # Run the command
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            
+            if result.returncode == 0:
+                write_site_log(f"lemimt processing completed successfully")
+                if result.stdout:
+                    write_site_log(f"lemimt output: {result.stdout}")
+                return True
+            else:
+                write_site_log(f"lemimt processing failed with return code: {result.returncode}", level="ERROR")
+                if result.stderr:
+                    write_site_log(f"lemimt error: {result.stderr}", level="ERROR")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            write_site_log(f"lemimt processing timed out after 5 minutes", level="ERROR")
+            return False
+        except Exception as e:
+            write_site_log(f"Error running lemimt: {e}", level="ERROR")
+            return False
+
+
+def read_processing_config(processing_file="Processing.txt"):
+    """Reads the Processing.txt file to get site-specific parameters and remote reference information.
+    
+    Args:
+        processing_file (str): Path to the Processing.txt file
+        
+    Returns:
+        dict: Dictionary mapping site names to their parameters and remote reference
+    """
+    config = {}
+    try:
+        with open(processing_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Skip header line
+        for line in lines[1:]:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                parts = [part.strip() for part in line.split(',')]
+                if len(parts) >= 4:
+                    site = parts[0]
+                    xarm = float(parts[1])
+                    yarm = float(parts[2])
+                    remote_ref = parts[3]
+                    
+                    config[site] = {
+                        'xarm': xarm,
+                        'yarm': yarm,
+                        'remote_reference': remote_ref
+                    }
+                    write_log(f"Loaded processing config for {site}: xarm={xarm}, yarm={yarm}, remote_ref={remote_ref}")
+        
+        return config
+    except FileNotFoundError:
+        write_log(f"Processing.txt file not found: {processing_file}", level="WARNING")
+        return {}
+    except Exception as e:
+        write_log(f"Error reading Processing.txt: {e}", level="ERROR")
+        return {}
+
+
+def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
+                              remote_reference_site=None, output_dir="outputs"):
+    """Generate a processing configuration file based on the MATLAB code structure.
+    
+    Args:
+        site_name (str): Name of the site being processed
+        gps_data (dict): Dictionary containing GPS coordinates and elevation
+        sample_interval (float): Sampling interval in seconds
+        has_remote_reference (bool): Whether remote reference processing is used
+        remote_reference_site (str): Name of the remote reference site
+        output_dir (str): Directory to save the config file
+        
+    Returns:
+        str: Path to the generated config file
+    """
+    # Create filename to match the output processed text file name
+    config_filename = f"{site_name}_output_processed.cfg"
+    config_path = os.path.join(output_dir, config_filename)
+    
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    
+    # Extract GPS data
+    latitude = gps_data.get('latitude', '0.0')
+    longitude = gps_data.get('longitude', '0.0')
+    elevation = gps_data.get('altitude', '0.0')
+    
+    # Magnetic declination (you may need to calculate this based on location and date)
+    # For now, using a placeholder - this should be calculated properly
+    declination = '0.0'  # TODO: Calculate actual declination
+    
+    # Determine number of channels
+    if has_remote_reference:
+        nchan = 7  # Bx, By, Bz, Ex, Ey + rBx, rBy
+    else:
+        nchan = 5  # Bx, By, Bz, Ex, Ey
+    
+    # Channel names (these should match your actual channel names)
+    C1 = 'Bx'  # First magnetic channel
+    C2 = 'By'  # Second magnetic channel  
+    C3 = 'Ex'  # First electric channel
+    C4 = 'Ey'  # Second electric channel
+    R1 = 'rBx' if has_remote_reference else None  # Remote reference Bx
+    R2 = 'rBy' if has_remote_reference else None  # Remote reference By
+    
+    with open(config_path, 'w') as f:
+        # Write header information
+        f.write(f"SITE {site_name}\n")
+        f.write(f"LATITUDE {latitude}\n")
+        f.write(f"LONGITUDE {longitude}\n")
+        f.write(f"ELEVATION {elevation}\n")
+        f.write(f"DECLINATION {declination}\n")
+        f.write(f"SAMPLING {sample_interval}\n\n")
+        f.write(f"NCHAN {nchan}\n")
+        
+        # Write channel configuration
+        if has_remote_reference:
+            # MT - with Remote Reference
+            f.write(f"  1   {C1} 1  l120new.rsp\n")
+            f.write(f"  2   {C2} 1  l120new.rsp\n")
+            f.write(f"  3   Bz 1  l120new.rsp\n")  # Added Bz channel
+            f.write(f"  4   {C3} 1  e000.rsp\n")
+            f.write(f"  5   {C4} 1  e000.rsp\n")
+            f.write(f"  6   {R1} 1  l120new.rsp\n")
+            f.write(f"  7   {R2} 1  l120new.rsp\n")
+            f.write(f"NREFCH        2\n")
+        else:
+            # MT - Single Site
+            f.write(f"  1   {C1} 1  l120new.rsp\n")
+            f.write(f"  2   {C2} 1  l120new.rsp\n")
+            f.write(f"  3   Bz 1  l120new.rsp\n")  # Added Bz channel
+            f.write(f"  4   {C3} 1  e000.rsp\n")
+            f.write(f"  5   {C4} 1  e000.rsp\n")
+    
+    write_log(f"Generated processing config file: {config_path}")
+    return config_path
+
+
+def decimate_dataframe(df, decimation_factor, sample_interval):
+    """Decimate a DataFrame by taking every nth row.
+    
+    Args:
+        df (pd.DataFrame): Input DataFrame
+        decimation_factor (int): Decimation factor (e.g., 2 for every 2nd row)
+        sample_interval (float): Original sample interval in seconds
+        
+    Returns:
+        tuple: (decimated_df, new_sample_interval)
+    """
+    if decimation_factor <= 1:
+        return df, sample_interval
+    
+    # Take every nth row
+    decimated_df = df.iloc[::decimation_factor].copy()
+    
+    # Update sample interval
+    new_sample_interval = sample_interval * decimation_factor
+    
+    write_log(f"Decimated data by factor {decimation_factor}: {len(df)} -> {len(decimated_df)} samples, "
+              f"sample interval: {sample_interval:.3f}s -> {new_sample_interval:.3f}s")
+    
+    return decimated_df, new_sample_interval
+
+
+def get_sample_rate_suffix(sample_interval):
+    """Get a suffix for filenames based on sample rate.
+    
+    Args:
+        sample_interval (float): Sample interval in seconds
+        
+    Returns:
+        str: Suffix like '_10Hz', '_5Hz', etc.
+    """
+    sample_rate = 1.0 / sample_interval
+    if sample_rate >= 1:
+        return f"_{int(sample_rate)}Hz"
+    else:
+        return f"_{sample_rate:.1f}Hz"
+
+
+def calculate_magnetic_declination(latitude, longitude, date=None):
+    """Calculate magnetic declination for a given location and date.
+    
+    This is a placeholder function. In practice, you would use a proper
+    magnetic declination calculator like the World Magnetic Model (WMM).
+    
+    Args:
+        latitude (float): Latitude in decimal degrees
+        longitude (float): Longitude in decimal degrees
+        date (datetime, optional): Date for calculation. Defaults to current date.
+        
+    Returns:
+        float: Magnetic declination in degrees
+    """
+    # TODO: Implement proper magnetic declination calculation
+    # For now, return a placeholder value
+    # You could use libraries like:
+    # - geomag (Python wrapper for WMM)
+    # - pyproj with magnetic models
+    # - Online APIs like NOAA's magnetic declination calculator
+    
+    return 0.0  # Placeholder
+
+
+def get_timezone_abbreviation(timezone_name):
+    """Get the abbreviation for a timezone name.
+    
+    Args:
+        timezone_name (str): Timezone name like 'Australia/Adelaide'
+        
+    Returns:
+        str: Timezone abbreviation like 'ACDT'
+        
+    Alternative display ideas for future consideration:
+    - Show timezone in plot title: "Time Series for HDD5449 (ACDT)"
+    - Add timezone info box in plot corner
+    - Use different colors for different timezones
+    - Show timezone conversion info in legend
+    """
+    timezone_abbrevs = {
+        'Australia/Adelaide': 'ACDT',
+        'Australia/Sydney': 'AEDT', 
+        'Australia/Perth': 'AWST',
+        'Australia/Darwin': 'ACST',
+        'Australia/Brisbane': 'AEST',
+        'America/New_York': 'EST',
+        'America/Chicago': 'CST',
+        'America/Denver': 'MST',
+        'America/Los_Angeles': 'PST',
+        'Europe/London': 'GMT',
+        'Europe/Paris': 'CET',
+        'Asia/Tokyo': 'JST',
+        'UTC': 'UTC'
+    }
+    return timezone_abbrevs.get(timezone_name, timezone_name.split('/')[-1].upper())
+
+
+def plot_welch_spectra(df, channels, fs, nperseg=1024, save_plots=False, site_name="UnknownSite", output_dir="."):
+    """Plots Welch power spectra for specified channels.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data.
+        channels (list): List of channel names to plot.
+        fs (float): Sampling frequency.
+        nperseg (int): Number of points per segment for FFT.
+        save_plots (bool): Whether to save plots to files.
+        site_name (str): Site name for plot titles and filenames.
+        output_dir (str): Directory to save plots in.
+    """
+    try:
+        fig, axes = plt.subplots(len(channels), 1, figsize=(12, 3*len(channels)))
+        if len(channels) == 1:
+            axes = [axes]
+        
+        for i, channel in enumerate(channels):
+            if channel in df.columns:
+                data = df[channel].dropna()
+                if len(data) > 0:
+                    f, Pxx = welch(data, fs=fs, nperseg=min(nperseg, len(data)//2))
+                    axes[i].semilogy(f, Pxx)
+                    axes[i].set_xlabel('Frequency [Hz]')
+                    axes[i].set_ylabel('Power Spectral Density')
+                    axes[i].set_title(f'{channel} Welch Power Spectrum - {site_name}')
+                    axes[i].grid(True)
+                else:
+                    axes[i].text(0.5, 0.5, f'No data for {channel}', ha='center', va='center', transform=axes[i].transAxes)
+            else:
+                axes[i].text(0.5, 0.5, f'Channel {channel} not found', ha='center', va='center', transform=axes[i].transAxes)
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_welch_spectra.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Welch spectra plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_welch_spectra: {e}", level="ERROR")
+
+
+def plot_multitaper_spectra(df, channels, fs, nperseg=1024, save_plots=False, site_name="UnknownSite", output_dir="."):
+    """Plots Multi-taper power spectra for specified channels.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data.
+        channels (list): List of channel names to plot.
+        fs (float): Sampling frequency.
+        nperseg (int): Number of points per segment for FFT.
+        save_plots (bool): Whether to save plots to files.
+        site_name (str): Site name for plot titles and filenames.
+        output_dir (str): Directory to save plots in.
+    """
+    try:
+        from scipy.signal import windows
+        
+        fig, axes = plt.subplots(len(channels), 1, figsize=(12, 3*len(channels)))
+        if len(channels) == 1:
+            axes = [axes]
+        
+        for i, channel in enumerate(channels):
+            if channel in df.columns:
+                data = df[channel].dropna()
+                if len(data) > 0:
+                    # Use DPSS (Discrete Prolate Spheroidal Sequences) windows for multi-taper
+                    # Number of tapers = 2*NW - 1, where NW is the time-bandwidth product
+                    NW = 4  # Time-bandwidth product
+                    K = 2 * NW - 1  # Number of tapers
+                    
+                    # Create DPSS windows
+                    window_length = min(nperseg, len(data)//2)
+                    if window_length % 2 == 0:
+                        window_length += 1  # Ensure odd length
+                    
+                    dpss_windows = windows.dpss(window_length, NW, Kmax=K)
+                    
+                    # Compute multi-taper power spectrum by averaging Welch estimates with different windows
+                    f, Pxx = welch(data, fs=fs, nperseg=window_length, window='hann')
+                    
+                    # For multi-taper, we'll use a simplified approach with multiple Welch estimates
+                    # This is not the full multi-taper method but provides similar benefits
+                    for k in range(K):
+                        # Use different window types to simulate multi-taper effect
+                        window_types = ['hann', 'hamming', 'blackman', 'bartlett']
+                        window_type = window_types[k % len(window_types)]
+                        _, Pxx_k = welch(data, fs=fs, nperseg=window_length, window=window_type)
+                        Pxx += Pxx_k
+                    Pxx /= (K + 1)  # Average including the initial estimate
+                    
+                    axes[i].semilogy(f, Pxx)
+                    axes[i].set_xlabel('Frequency [Hz]')
+                    axes[i].set_ylabel('Power Spectral Density')
+                    axes[i].set_title(f'{channel} Multi-taper Power Spectrum - {site_name}')
+                    axes[i].grid(True)
+                else:
+                    axes[i].text(0.5, 0.5, f'No data for {channel}', ha='center', va='center', transform=axes[i].transAxes)
+            else:
+                axes[i].text(0.5, 0.5, f'Channel {channel} not found', ha='center', va='center', transform=axes[i].transAxes)
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_multitaper_spectra.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Multi-taper spectra plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_multitaper_spectra: {e}", level="ERROR")
+
+
+def plot_spectrograms(df, channels, fs, nperseg=256, save_plots=False, site_name="UnknownSite", output_dir="."):
+    """Plots spectrograms for specified channels.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data.
+        channels (list): List of channel names to plot.
+        fs (float): Sampling frequency.
+        nperseg (int): Number of points per segment for FFT.
+        save_plots (bool): Whether to save plots to files.
+        site_name (str): Site name for plot titles and filenames.
+        output_dir (str): Directory to save plots in.
+    """
+    try:
+        fig, axes = plt.subplots(len(channels), 1, figsize=(14, 3*len(channels)))
+        if len(channels) == 1:
+            axes = [axes]
+        
+        for i, channel in enumerate(channels):
+            if channel in df.columns:
+                data = df[channel].dropna()
+                if len(data) > 0:
+                    # Use shorter segments for spectrogram
+                    nperseg_spec = min(nperseg, len(data)//4)
+                    f, t, Sxx = spectrogram(data, fs=fs, nperseg=nperseg_spec, noverlap=nperseg_spec//2)
+                    
+                    # Plot spectrogram
+                    im = axes[i].pcolormesh(t, f, 10 * np.log10(Sxx), shading='gouraud')
+                    axes[i].set_ylabel('Frequency [Hz]')
+                    axes[i].set_title(f'{channel} Spectrogram - {site_name}')
+                    
+                    # Add colorbar
+                    cbar = plt.colorbar(im, ax=axes[i])
+                    cbar.set_label('Power Spectral Density [dB/Hz]')
+                else:
+                    axes[i].text(0.5, 0.5, f'No data for {channel}', ha='center', va='center', transform=axes[i].transAxes)
+            else:
+                axes[i].text(0.5, 0.5, f'Channel {channel} not found', ha='center', va='center', transform=axes[i].transAxes)
+        
+        # Set x-axis label for the last subplot
+        if len(axes) > 0:
+            axes[-1].set_xlabel('Time [s]')
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_spectrograms.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Spectrograms plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_spectrograms: {e}", level="ERROR")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process MT ASCII data files for a given site.")
+    parser.add_argument("--input_dir", required=True, help="Directory containing ASCII data files.")
+    parser.add_argument("--param_file", default="config/recorder.ini", help="Path to the parameter file (default: config/recorder.ini)")
+    parser.add_argument("--average", action="store_true", help="Average values over intervals.")
+    parser.add_argument("--perform_freq_analysis", nargs="?", const="W", metavar="METHODS",
+                        help="Perform frequency analysis. Use W for Welch, M for Multi-taper, S for Spectrogram. "
+                             "Combine them: 'WMS' for all three, 'WM' for Welch + Multi-taper, etc. Default: W")
+    parser.add_argument("--plot_data", action="store_true", help="Display physical channel plots.")
+    parser.add_argument("--apply_smoothing", action="store_true", help="Apply smoothing to the data.")
+    parser.add_argument("--smoothing_window", type=int, default=2500, help="Window size for smoothing.")
+    parser.add_argument("--threshold_factor", type=float, default=10.0, help="Threshold multiplier for outlier detection.")
+    parser.add_argument("--plot_boundaries", action="store_true", help="Plot file boundaries.")
+    parser.add_argument("--plot_smoothed_windows", action="store_true", help="Shade smoothed windows.")
+    parser.add_argument("--plot_coherence", action="store_true", help="Plot power spectra and coherence.")
+    parser.add_argument("--log_first_rows", action="store_true", help="Log the first 5 rows from each file.")
+    parser.add_argument("--apply_drift_correction", action="store_true", help="Apply drift correction to the data.")
+    parser.add_argument("--apply_rotation", action="store_true", help="Apply rotation correction based on the 'erotate' parameter.")
+    parser.add_argument("--plot_drift", action="store_true", help="Plot drift-corrected data in timeseries (default: False)")
+    parser.add_argument("--plot_rotation", action="store_true", help="Plot rotated data in timeseries (default: False)")
+    parser.add_argument("--plot_tilt", action="store_true", help="Plot tilt-corrected data in timeseries (default: False)")
+    parser.add_argument("--timezone", nargs="+", default=["UTC"], 
+                        help="Timezone(s) for the data. Use one timezone for both sites (e.g., 'Australia/Adelaide') or two timezones for main and remote sites (e.g., 'Australia/Adelaide' 'UTC')")
+    parser.add_argument("--plot_original_data", action="store_true", help="Plot original data alongside corrected data (default: False)")
+    parser.add_argument("--smoothing_method", default="median",
+                        choices=["median", "adaptive"],
+                        help="Smoothing method to use: 'median' for median/MAD, 'adaptive' for adaptive median filtering")
+    parser.add_argument("--tilt_correction", nargs='?', const=True, metavar='RR', 
+                        help="Apply tilt correction so that mean(By) is zero. Use 'RR' to also apply to remote reference channels.")
+    parser.add_argument("--sens_start", type=int, default=0, help="(Unused) Start sample index for sensitivity test")
+    parser.add_argument("--sens_end", type=int, default=5000, help="(Unused) End sample index for sensitivity test")
+    parser.add_argument("--skip_minutes", nargs=2, type=int, default=[0, 0], metavar=('START', 'END'),
+                        help="Minutes to skip from start and end of data (e.g., '30 20' skips first 30 and last 20 minutes)")
+    parser.add_argument("--save_plots", action="store_true", help="Save plots to files instead of displaying them")
+    parser.add_argument("--save_raw_data", action="store_true", default=False, help="Save raw (unprocessed) data to file")
+    parser.add_argument("--save_processed_data", action="store_true", default=False, help="Save processed data to file")
+    parser.add_argument("--remote_reference", type=str, default=None,
+                        help="Site name to use as remote reference (only Bx and By will be loaded and merged as rBx, rBy)")
+    parser.add_argument("--decimate", nargs="+", type=int, default=None,
+                        help="Decimation factors to apply (e.g., '2 5 10' for 2x, 5x, 10x decimation). Each factor will create separate output files with sample rate suffix.")
+    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Log level for output (default: INFO)")
+    parser.add_argument("--run_lemimt", action="store_true", default=False,
+                        help="Run lemimt.exe on the processed output file after processing is complete")
+    parser.add_argument("--lemimt_path", type=str, default="lemimt.exe",
+                        help="Full path to the lemimt.exe executable (default: lemimt.exe in current directory)")
+
+    args = parser.parse_args()
+    
+    # Set up logging
+    set_log_level(args.log_level)
+    
+    # Process the site
+    # Determine decimation factors to process
+    if args.decimate:
+        decimation_factors = [1] + args.decimate  # Always include original (factor 1)
+        write_log(f"Processing with decimation factors: {decimation_factors}")
+    else:
+        decimation_factors = [1]  # Just process original data
+        write_log("Processing original data only (no decimation)")
+    
+    # Process each decimation factor
+    for decimation_factor in decimation_factors:
+        write_log(f"Processing with decimation factor: {decimation_factor}")
+        
+        # Create processor for this decimation factor
+        processor = ProcessASCII(
+            input_dir=args.input_dir,
+            param_file="config/recorder.ini",  # Use default path
+            average=args.average,
+            perform_freq_analysis=args.perform_freq_analysis,
+            plot_data=args.plot_data,
+            apply_smoothing=args.apply_smoothing,
+            smoothing_window=args.smoothing_window,
+            threshold_factor=args.threshold_factor,
+            plot_boundaries=args.plot_boundaries,
+            plot_smoothed_windows=args.plot_smoothed_windows,
+            plot_coherence=args.plot_coherence,
+            log_first_rows=args.log_first_rows,
+            smoothing_method=args.smoothing_method,
+            sens_start=args.sens_start,
+            sens_end=args.sens_end,
+            skip_minutes=args.skip_minutes,
+            apply_drift_correction=args.apply_drift_correction,
+            apply_rotation=args.apply_rotation,
+            plot_drift=args.plot_drift,
+            plot_rotation=args.plot_rotation,
+            plot_tilt=args.plot_tilt,
+            timezone=args.timezone,
+            plot_original_data=args.plot_original_data,
+            save_raw_data=args.save_raw_data,
+            save_processed_data=args.save_processed_data,
+            remote_reference=args.remote_reference
+        )
+        processor.tilt_correction = args.tilt_correction
+        processor.save_plots = args.save_plots
+        
+        # Store decimation factor for use in processing
+        processor.decimation_factor = decimation_factor
+        
+        # Set lemimt parameters
+        processor.run_lemimt = args.run_lemimt
+        processor.lemimt_path = args.lemimt_path
+        
+        # Process the data
+        processor.process_all_files()
+        
+        # Run lemimt processing if requested
+        if args.run_lemimt and args.save_processed_data:
+            # Find the processed output file
+            site_name = os.path.basename(args.input_dir)
+            output_dir = f"outputs/{site_name}"
+            
+            # Determine the filename based on decimation factor
+            if decimation_factor == 1:
+                processed_file = f"{output_dir}/{site_name}_output_processed.txt"
+            else:
+                sample_interval = processor.metadata.get("sample_interval", 0.1)
+                suffix = get_sample_rate_suffix(sample_interval * decimation_factor)
+                processed_file = f"{output_dir}/{site_name}_{suffix}_output_processed.txt"
+            
+            # Check if the file exists, if not try alternative naming patterns
+            if not os.path.exists(processed_file):
+                # Try to find the actual processed file by looking in the output directory
+                import glob
+                pattern = f"{output_dir}/{site_name}*_output_processed.txt"
+                matching_files = glob.glob(pattern)
+                if matching_files:
+                    processed_file = matching_files[0]  # Use the first matching file
+                    write_log(f"Found processed file for lemimt: {processed_file}")
+                else:
+                    write_log(f"No processed files found matching pattern: {pattern}", level="WARNING")
+                    continue
+            
+            if os.path.exists(processed_file):
+                write_log(f"Running lemimt processing on: {processed_file}")
+                success = processor.run_lemimt_processing(processed_file)
+                if success:
+                    write_log(f"lemimt processing completed successfully for {processed_file}")
+                else:
+                    write_log(f"lemimt processing failed for {processed_file}", level="WARNING")
+            else:
+                write_log(f"Processed file not found for lemimt processing: {processed_file}", level="WARNING")
+        
+        write_log(f"Completed processing for decimation factor: {decimation_factor}")
+    
+    write_log("All decimation processing completed")
+
+"""
+Example usage:
+
+# BASIC PROCESSING EXAMPLES
+# =========================
+
+# Basic processing with plotting and saving plots:
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots
+
+# Basic processing with data saving (both raw and processed):
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_raw_data --save_processed_data
+
+# Basic processing with only processed data saving:
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data
+
+# Basic processing with only raw data saving:
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_raw_data
+
+# SMOOTHING EXAMPLES
+# ==================
+
+# Median smoothing with default settings:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --save_plots --save_processed_data
+
+# Adaptive median filtering:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_method adaptive --save_plots --save_processed_data
+
+# Custom smoothing window and threshold:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_window 1000 --threshold_factor 5.0 --save_plots --save_processed_data
+
+# CORRECTION EXAMPLES
+# ===================
+
+# Drift correction only:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --plot_drift --save_plots --save_processed_data
+
+# Rotation correction only:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_rotation --plot_rotation --save_plots --save_processed_data
+
+# Tilt correction only:
+python EDL_Process.py --input_dir HDD5449 --plot_data --tilt_correction --plot_tilt --save_plots --save_processed_data
+
+# Tilt correction including remote reference channels:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --tilt_correction RR --plot_tilt --save_plots --save_processed_data
+
+# Combined corrections (drift + rotation):
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --save_plots --save_processed_data
+
+# Combined corrections (drift + rotation + tilt):
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --save_plots --save_processed_data
+
+# Combined corrections (drift + rotation + tilt with remote reference):
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --apply_drift_correction --apply_rotation --tilt_correction RR --plot_drift --plot_rotation --plot_tilt --save_plots --save_processed_data
+
+# COMPARISON PLOTTING EXAMPLES
+# ============================
+
+# Plot original data alongside tilt-corrected data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --tilt_correction --plot_tilt --plot_original_data --save_plots --save_processed_data
+
+# Plot original data alongside drift-corrected data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --plot_drift --plot_original_data --save_plots --save_processed_data
+
+# Plot original data alongside rotated data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_rotation --plot_rotation --plot_original_data --save_plots --save_processed_data
+
+# TIMEZONE EXAMPLES
+# =================
+
+# Process with single timezone for both sites (Australia/Adelaide):
+python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "Australia/Adelaide" --save_plots --save_processed_data
+
+# Process with single timezone for both sites (America/New_York):
+python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "America/New_York" --save_plots --save_processed_data
+
+# Process with different timezones for main and remote sites:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --timezone "Australia/Adelaide" "UTC" --save_plots --save_processed_data
+
+# Process with timezone conversion and corrections:
+python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "Australia/Adelaide" --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data
+
+# DATA SKIPPING EXAMPLES
+# ======================
+
+# Skip first 10 minutes of data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 10 0 --save_plots --save_processed_data
+
+# Skip last 20 minutes of data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 0 20 --save_plots --save_processed_data
+
+# Skip first 30 minutes and last 20 minutes of data:
+python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 30 20 --save_plots --save_processed_data
+
+# Skip first 30 minutes with corrections:
+python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 30 0 --apply_drift_correction --tilt_correction --save_plots --save_processed_data
+
+# FREQUENCY ANALYSIS EXAMPLES
+# ===========================
+
+# Basic frequency analysis (Welch spectra only - default):
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis --save_plots
+
+# Welch spectral analysis only:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis W --save_plots
+
+# Multi-taper spectral analysis only:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis M --save_plots
+
+# Spectrogram analysis only:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis S --save_plots
+
+# Welch + Multi-taper analysis:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WM --save_plots
+
+# Welch + Spectrogram analysis:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WS --save_plots
+
+# Multi-taper + Spectrogram analysis:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis MS --save_plots
+
+# All three methods (Welch + Multi-taper + Spectrogram):
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WMS --save_plots
+
+# Frequency analysis with corrections:
+python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WMS --apply_drift_correction --apply_rotation --save_plots
+
+# Frequency analysis with remote reference:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --perform_freq_analysis WMS --save_plots
+
+# COHERENCE ANALYSIS EXAMPLES
+# ===========================
+
+# Plot MT-specific coherence (Bx-Ey, By-Ex):
+python EDL_Process.py --input_dir HDD5449 --plot_coherence --save_plots
+
+# Coherence with remote reference (includes Bx-rBx, By-rBy, etc.):
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_coherence --save_plots
+
+# Coherence with corrections:
+python EDL_Process.py --input_dir HDD5449 --plot_coherence --apply_drift_correction --apply_rotation --save_plots
+
+# ADVANCED COMBINATIONS
+# =====================
+
+# Full processing pipeline with all corrections, smoothing, and analysis:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --plot_coherence --plot_drift --plot_rotation --plot_tilt --plot_original_data --timezone "Australia/Sydney" --skip_minutes 5 --save_plots --save_raw_data --save_processed_data
+
+# Processing with custom smoothing parameters:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_window 500 --threshold_factor 3.0 --smoothing_method median --plot_boundaries --plot_smoothed_windows --save_plots --save_processed_data
+
+# Processing with all corrections but no smoothing:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_original_data --save_plots --save_processed_data
+
+# MINIMAL PROCESSING EXAMPLES
+# ===========================
+
+# Just plot the data without any corrections or saving:
+python EDL_Process.py --input_dir HDD5449 --plot_data
+
+# Just save processed data without plotting:
+python EDL_Process.py --input_dir HDD5449 --save_processed_data
+
+# Just save raw data without plotting:
+python EDL_Process.py --input_dir HDD5449 --save_raw_data
+
+# DEBUGGING EXAMPLES
+# ==================
+
+# Log first few rows from each file for debugging:
+python EDL_Process.py --input_dir HDD5449 --log_first_rows --plot_data --save_plots
+
+# Process with detailed logging and all options:
+python EDL_Process.py --input_dir HDD5449 --log_first_rows --plot_data --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --perform_freq_analysis WMS --plot_coherence --plot_drift --plot_rotation --plot_tilt --plot_original_data --plot_boundaries --plot_smoothed_windows --save_plots --save_raw_data --save_processed_data
+
+# BATCH PROCESSING EXAMPLES
+# =========================
+
+# For batch processing multiple sites, use Test_Batch.py:
+python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data
+
+# Batch processing with corrections:
+python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data
+
+# DECIMATION EXAMPLES
+# ===================
+
+# Process with 2x decimation (5 Hz output):
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --decimate 2
+
+# Process with multiple decimation factors (10 Hz, 5 Hz, 2 Hz, 1 Hz):
+python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --decimate 2 5 10
+
+# Decimation with corrections:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data --decimate 2 5
+
+# Decimation with remote reference:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --save_plots --save_processed_data --decimate 2 5 10
+
+# NOTES:
+# - GPS coordinates and field strengths are automatically displayed in the plot
+# - Raw data contains the original ASCII values before conversion to physical units
+# - Processed data contains the final corrected values in physical units
+# - Plots show GPS coordinates (bottom left) and field strengths (bottom right)
+# - All data files are saved to outputs/[site_name]/ directory
+# - Use --save_plots to save plots instead of displaying them
+# - Use --save_raw_data and/or --save_processed_data to control data file output
+# - lemimt.exe processing is only available on Windows systems
+# - For non-Windows systems, the command to run lemimt will be logged for manual execution
+
+# LEMIMT PROCESSING EXAMPLES
+# ==========================
+
+# Basic lemimt processing (requires Windows):
+python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt
+
+# lemimt processing with custom executable path:
+python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt --lemimt_path "C:/Program Files/lemimt/lemimt.exe"
+
+# lemimt processing with full processing pipeline:
+python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_processed_data --run_lemimt
+
+# lemimt processing with decimation:
+python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt --decimate 2 5
+
+# lemimt processing with remote reference:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --save_processed_data --run_lemimt
+"""
