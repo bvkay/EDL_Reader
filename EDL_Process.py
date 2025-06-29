@@ -2574,6 +2574,8 @@ pause
 def read_processing_config(processing_file="Processing.txt"):
     """Reads the Processing.txt file to get site-specific parameters and remote reference information.
     
+    Supports both 3-column format (Site, xarm, yarm) and 4-column format (Site, xarm, yarm, RemoteReference).
+    
     Args:
         processing_file (str): Path to the Processing.txt file
         
@@ -2585,24 +2587,53 @@ def read_processing_config(processing_file="Processing.txt"):
         with open(processing_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # Skip header line
-        for line in lines[1:]:
+        # Skip header line if it exists (only if it contains "Site" or looks like a header)
+        start_line = 0
+        if lines and len(lines) > 0:
+            first_line = lines[0].strip().lower()
+            if first_line.startswith('site') or first_line.startswith('site,'):
+                start_line = 1
+                write_log(f"Skipping header line: {lines[0].strip()}")
+        
+        for line in lines[start_line:]:
             line = line.strip()
             if line and not line.startswith('#'):
                 parts = [part.strip() for part in line.split(',')]
-                if len(parts) >= 4:
+                
+                # Handle both 3-column and 4-column formats
+                if len(parts) >= 3:
                     site = parts[0]
-                    xarm = float(parts[1])
-                    yarm = float(parts[2])
-                    remote_ref = parts[3]
-                    
-                    config[site] = {
-                        'xarm': xarm,
-                        'yarm': yarm,
-                        'remote_reference': remote_ref
-                    }
+                    try:
+                        xarm = float(parts[1])
+                        yarm = float(parts[2])
+                        
+                        # Set remote reference based on number of columns
+                        if len(parts) >= 4:
+                            remote_ref = parts[3]
+                        else:
+                            remote_ref = "None"  # No remote reference specified
+                        
+                        config[site] = {
+                            'xarm': xarm,
+                            'yarm': yarm,
+                            'remote_reference': remote_ref
+                        }
+                        
+                        write_log(f"Loaded config for {site}: xarm={xarm} m, yarm={yarm} m, remote_ref={remote_ref}")
+                        
+                    except ValueError as e:
+                        write_log(f"Error parsing numeric values for site {site}: {e}", level="WARNING")
+                        continue
+                else:
+                    write_log(f"Skipping invalid line (insufficient columns): {line}", level="WARNING")
+        
+        if not config:
+            write_log(f"No valid site configurations found in {processing_file}", level="WARNING")
+        else:
+            write_log(f"Successfully loaded {len(config)} site configurations from {processing_file}")
         
         return config
+        
     except FileNotFoundError:
         write_log(f"Processing.txt file not found: {processing_file}", level="WARNING")
         return {}
