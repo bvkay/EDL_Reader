@@ -65,9 +65,9 @@ The project expects the following directory and file organization:
 └── ...
 ```
 
-- **HDDxxxx/**: Site folders, each with subfolders for each day (e.g., 294, 295), containing ASCII data files.
-- **outputs/**: All processed data and plots are saved here, organized by site.
-- **sensors/**: Instrument response files.
+- **SiteName/**: Site folders, each with subfolders for each day (e.g., 294, 295), containing EDL ASCII data files.
+- **outputs/**: All plots are saved here, organized by site.
+- **sensors/**: Instrument response files (not relevant for LP fluxgate sensor).
 
 ---
 ## Installation
