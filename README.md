@@ -5,19 +5,21 @@ A Python-based workflow for reading, processing, and analyzing magnetotelluric (
 ---
 
 
-## Features
+## Key Features
 
-- Read and process MT ASCII data from multiple sites and days
-- Apply drift, rotation, and tilt corrections
-- Smoothing and outlier removal
-- Merge remote reference data
-- Frequency analysis: Welch, Multi-taper, Spectrogram
-- Coherence analysis (MT and remote reference) and heatmaps
-- Batch processing across multiple sites
-- Integration with LEMI MT executable (`lemimt.exe`)
-- Flexible timezone handling
-- Parallel processing of multiple sites with clear logging and summary tables.
-- Comprehensive logging and output management
+- **ASCII Data Processing**: Reads EDL ASCII files (.BX, .BY, .BZ, .EX, .EY) and converts to physical units.
+- **Metadata Handling**: Extracts metadata from `recorder.ini`, `*.gps` and `Processing.txt`.
+- **Corrections**: Optional drift, rotation, and tilt correction (including remote reference tilt).
+- **Smoothing**: Median/MAD and adaptive median filtering for outlier removal.
+- **Filtering**: Comb, bandpass, highpass, lowpass, and adaptive filtering (for powerline and other noise).
+- **Remote Reference**: Merges remote reference site data for robust processing.
+- **Frequency Analysis**: Welch, multi-taper, and spectrogram analysis.
+- **Heatmaps**: Coherence heatmaps, histograms, and barcode plots for quality control.
+- **Batch Processing**: Parallel processing of multiple sites with clear logging and summary tables.
+- **Configuration-Driven Processing**: Use `Processing.txt` to specify sites and their parameters.
+- **lemimt.exe Integration**: Optionally runs lemimt.exe on processed output (Windows only).
+- **Comprehensive Logging**: Main and per-site logs, with clear headers and summary tables.
+- **Parallel Processing**: Multi-threaded batch processing with worker prefixes (P01_, P02_, etc.).
 
 ---
 
@@ -30,6 +32,7 @@ The project expects the following directory and file organization:
 ├── EDL_Process.py
 ├── EDL_Batch.py
 ├── EDL_Reader.py
+├── Processing.txt
 ├── outputs/
 │   └── [SiteName]/
 │       ├── [SiteName]_output_processed.txt
@@ -78,12 +81,6 @@ Install dependencies:
 pip install numpy pandas matplotlib scipy configparser pytz
 ```
 
-**Clone the repository:**
-```bash
-git clone https://github.com/yourusername/EDL_MT_Processing.git
-cd EDL_MT_Processing
-```
-
 ## Configuration File Format
 
 The `Processing.txt` file can be used to specify sites and their parameters for batch processing. It supports both 3-column and 4-column formats:
@@ -91,20 +88,17 @@ The `Processing.txt` file can be used to specify sites and their parameters for 
 ### 4-Column Format (with remote reference)
 ```csv
 Site, xarm, yarm, RemoteReference
-SiteA-50m, 45, 50, SiteD-50m
-SiteB-10m, 10, 9.8, SiteD-50m
-SiteC-10m, 10, 9.8, SiteD-50m
-SiteD-50m, 50, 49.5, SiteA-50m
-SiteA-50m, 45, 50, SiteB-10m
-SiteB-10m, 10, 9.8, 
-SiteC-10m, 10, 9.8, 
-SiteD-50m, 50, 49.5
+SiteA-50m, 100.0, 100.0, SiteD-10m
+SiteB-50m, 100.0, 100.0, [SiteC-10m; SiteD-10m]
+SiteC-10m, 50.0, 50.0,
+SiteD-10m, 50.0, 50.0, SiteA-50m
+
 ```
 **Column Definitions:**
 - **Site**: Site directory name
 - **xarm**: X dipole length in meters
 - **yarm**: Y dipole length in meters
-- **RemoteReference**: (Optional) Remote reference site name
+- **RemoteReference**: (Optional) Remote reference site name, can be multiple with square brakets
 
 ## Batch Processing with --config_file
 
@@ -120,136 +114,139 @@ python EDL_Batch.py --config_file Processing.txt --parent_dir . --plot_data --sa
 
 See the updated script help (`-h`) for more details.
 
-## Usage
-
 ### Single-Site Processing
 
 ```bash
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data
+python EDL_Process.py --site_name SiteA-50m --plot_timeseries --tilt_correction
 ```
 
 #### Common Options
-- `--input_dir [DIR]`         Directory with ASCII data files
-- `--plot_data`               Show/save physical channel plots
-- `--save_plots`              Save plots to outputs/[SiteName]/
-- `--save_processed_data`     Save processed output text file
-- `--apply_drift_correction`  Apply drift correction
-- `--apply_rotation`          Apply rotation correction
-- `--tilt_correction`         Apply tilt correction (add 'RR' for remote reference tilt)
-- `--apply_smoothing`         Apply smoothing (median/adaptive)
-- `--perform_freq_analysis`   Frequency analysis (W=Welch, M=Multi-taper, S=Spectrogram, e.g. 'WMS')
-- `--apply_filtering`         Apply frequency filtering (see below)
+- `--site_name [SITE]`       Site directory name (required)
+- `--plot_timeseries`        Show/save physical channel plots
+- `--apply_drift_correction` Apply drift correction
+- `--apply_rotation`         Apply rotation correction
+- `--tilt_correction`        Apply tilt correction to Bx, By, rBx, rBy channels
+- `--apply_smoothing`        Apply smoothing (median/adaptive)
+- `--perform_freq_analysis`  Frequency analysis (W=Welch, M=Multi-taper, S=Spectrogram, e.g. 'WMS')
+- `--apply_filtering`        Apply frequency filtering (see below)
 - `--remote_reference [SITE]` Use another site as remote reference
-- `--decimate [N ...]`        Decimate by factors N (e.g. 2 5 10)
-- `--run_lemimt`              Run lemimt.exe on processed output (Windows only)
+- `--decimate [N ...]`       Decimate by factors N (e.g. 2 5 10)
+- `--run_lemimt`             Run lemimt.exe on processed output (Windows only)
 
 #### Example: Full Pipeline
 ```bash
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --plot_coherence --remote_reference HDD5974 --decimate 2 5 --run_lemimt
+python EDL_Process.py --site_name SiteA-50m --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --remote_reference SiteD-10m --decimate 2 5 --run_lemimt
 ```
 
 ### Batch Processing
 
-#### Method 1: Manual Site Listing
-Process multiple sites in parallel by listing them manually:
-```bash
-python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
-```
-
-#### Method 2: Configuration File (Recommended)
 Use `Processing.txt` to specify sites and their parameters:
 ```bash
-python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
+python EDL_Batch.py --input_config --plot_timeseries --tilt_correction --max_workers 4
 ```
 
-**Benefits of using `--config_file`:**
-- Site-specific dipole lengths (xarm, yarm) are automatically applied
-- Site-specific remote reference assignments are used
-- No need to manually list all sites
-- Easy to modify processing parameters for different sites
-- Supports different remote reference configurations per site
-
 #### Batch Options
-- `--sites [SITES ...]`       List of site directories to process (mutually exclusive with --config_file)
-- `--config_file [FILE]`      Path to Processing.txt or similar config file (mutually exclusive with --sites)
-- `--parent_dir [DIR]`        Parent directory containing site folders
-- `--max_workers [N]`         Number of parallel processes (default: 4)
+- `--input_config`           Use Processing.txt for site configuration (required)
+- `--max_workers [N]`        Number of parallel workers (default: 4)
 - All single-site options can be used in batch mode
+
+#### Example: Full Batch Pipeline
+```bash
+python EDL_Batch.py --input_config --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --plot_heatmaps --run_lemimt --max_workers 4
+```
 
 ### Filtering Examples
 
 - Comb filter (default, 50 Hz):
   ```bash
-  python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --save_processed_data
+  python EDL_Process.py --site_name SiteA-50m --apply_filtering --filter_type comb --plot_timeseries
   ```
 - Bandpass filter:
   ```bash
-  python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --save_processed_data
+  python EDL_Process.py --site_name SiteA-50m --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --plot_timeseries
   ```
 - Adaptive filtering (with remote reference):
   ```bash
-  python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_reference_channel rBx --save_processed_data
+  python EDL_Process.py --site_name SiteA-50m --remote_reference SiteD-10m --apply_filtering --filter_type adaptive --filter_reference_channel rBx --plot_timeseries
   ```
 
 ### Heatmap and Frequency Analysis
 
 - Coherence heatmaps:
   ```bash
-  python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --save_plots
+  python EDL_Process.py --site_name SiteA-50m --plot_heatmaps
   ```
 - Frequency analysis (Welch, Multi-taper, Spectrogram):
-    ```bash
-    python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WMS --save_plots
-    ```
+  ```bash
+  python EDL_Process.py --site_name SiteA-50m --perform_freq_analysis WMS --plot_timeseries
+  ```
+
+### Advanced Processing Examples
+
+#### Basic Processing
+```bash
+python EDL_Process.py --site_name SiteA-50m --plot_timeseries --tilt_correction
+```
+
+#### With Remote Reference
+```bash
+python EDL_Process.py --site_name SiteB-50m --remote_reference SiteD-10m --plot_timeseries
+```
+
+#### With Smoothing and Analysis
+```bash
+python EDL_Process.py --site_name SiteC-10m --apply_smoothing --plot_timeseries --run_lemimt
+```
+
+#### Batch Processing Examples
+```bash
+# Basic batch processing
+python EDL_Batch.py --input_config --max_workers 4 --plot_timeseries --tilt_correction
+
+# Full processing pipeline
+python EDL_Batch.py --input_config --max_workers 2 --run_lemimt
+
+# Advanced processing with filtering
+python EDL_Process.py --site_name SiteA-50m --plot_timeseries --apply_filtering --filter_type comb --filter_notch_freq 50.0
+
+# Heatmap generation
+python EDL_Process.py --site_name SiteB-50m --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.5"
+
+# Decimation processing
+python EDL_Process.py --site_name SiteC-10m --decimate 2 5 10 --plot_timeseries
+```
 
 ### Output Naming Conventions
 
-- Processed data: `[SiteName]_[SampleRate]Hz_Process.txt` (e.g., `HDD5449_10Hz_Process.txt`)
-- Config file:    `[SiteName]_[SampleRate]Hz_Process.cfg`
+- Processed data: `P##_[SiteName]_[SampleRate]Hz_Process.txt` (e.g., `P01_SiteA-50m_10Hz_Process.txt`)
+- Config file:    `P##_[SiteName]_[SampleRate]Hz_Process.cfg`
 - Plots:          `outputs/[SiteName]/[SiteName]_[SampleRate]Hz_[plot_type].png`
 - Logs:           `process_ascii.log` (main), `[SiteName].log` (per site)
 
-### lemimt.exe Integration
-- **Windows users:** Place `lemimt.exe` in the `2025_EDL/` folder (the project root). The `--run_lemimt` option will run lemimt.exe automatically on the processed file.
-- On macOS/Linux: A batch script is generated and the command is logged for manual execution on Windows.
+**Note:** The `P##_` prefix is automatically assigned based on the worker number during parallel processing to prevent file overwrites.
 
-## Example Workflows
+### Remote Reference Processing
+- Automatically reads station identifiers from `[recorder]` section of recorder.ini
+- Supports multiple remote references per site: `[SiteA; SiteB]`
+- Creates separate output files for each remote reference
+- Enhanced error handling and logging for remote reference loading
 
-#### Single Site, All Corrections, Save Everything
-```bash
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --remote_reference HDD5974 --perform_freq_analysis WMS --plot_heatmaps --run_lemimt
-```
-
-#### Batch Processing with Configuration File (Recommended)
-```bash
-python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
-```
-
-#### Batch Processing with Manual Site Listing
-```bash
-python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
-```
-
-#### Filtering and Decimation
-```bash
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --decimate 2 5 --save_processed_data
-```
-
-#### Heatmap and Frequency Analysis
-```bash
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --perform_freq_analysis WMS --save_plots
-```
-
-## Output Files
-- Processed data: `[SiteName]_[SampleRate]Hz_Process.txt`
-- Config:         `[SiteName]_[SampleRate]Hz_Process.cfg`
-- Plots:          `outputs/[SiteName]/`
-- Logs:           `process_ascii.log`, `[SiteName].log`
+### Parallel Processing
+- Uses ThreadPoolExecutor for efficient parallel processing
+- Worker numbers (P01_, P02_, etc.) prevent file overwrites
+- Environment variables pass worker information to subprocesses
+- Configurable number of workers with `--max_workers`
 
 ## Troubleshooting
-- If `lemimt.exe` cannot be run on your platform, transfer the processed file and batch script to a Windows machine.
-- For timezone issues, use `--timezone "Australia/Adelaide"` or your local zone.
-- For remote reference, ensure both sites are present and have valid data.
-- For more help, run `python EDL_Process.py --help` or `python EDL_Batch.py --help`.
 
----
+### Common Issues
+
+1. **Remote Reference Not Found**: Ensure the remote site directory exists and contains valid data files
+2. **Station Identifier Issues**: Check that recorder.ini contains `station_long_identifier` in the `[recorder]` section
+3. **File Overwrites**: Worker prefixes (P01_, P02_, etc.) are automatically applied during parallel processing
+4. **lemimt.exe Not Found**: Place lemimt.exe in the project root directory for Windows processing
+
+### Log Files
+- Main log: `process_ascii.log`
+- Site-specific logs: `[SiteName].log`
+- Batch processing summary is printed to console
