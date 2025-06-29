@@ -15,6 +15,8 @@ import glob
 from math import radians, cos, sin, asin, sqrt
 import matplotlib.dates as mdates
 from scipy.signal import windows
+import time
+import threading
 
 # Global logging configuration
 LOG_LEVELS = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
@@ -372,11 +374,11 @@ def rotate_data(df, metadata):
     return df
 
 def tilt_correction(df, include_remote_reference=False):
-    """Applies tilt correction to make mean(By) = 0.
+    """Applies tilt correction to make mean(By) = 0 for all Bx, By, rBx, rBy channels.
     
     Args:
-        df (pd.DataFrame): DataFrame with Bx, By columns
-        include_remote_reference (bool): Whether to also apply tilt correction to rBx, rBy channels
+        df (pd.DataFrame): DataFrame with Bx, By columns and optionally rBx, rBy columns
+        include_remote_reference (bool): Deprecated parameter, kept for compatibility
         
     Returns:
         tuple: (corrected_df, tilt_angle_degrees)
@@ -398,8 +400,8 @@ def tilt_correction(df, include_remote_reference=False):
         
         write_log(f"Applied tilt correction to main channels: {tilt_angle_degrees:.2f} degrees")
     
-    # Apply tilt correction to remote reference channels if requested and available
-    if include_remote_reference and 'rBx' in df_corrected.columns and 'rBy' in df_corrected.columns:
+    # Always apply tilt correction to remote reference channels if available
+    if 'rBx' in df_corrected.columns and 'rBy' in df_corrected.columns:
         # Calculate separate tilt angle for remote reference channels using their means
         remote_tilt_angle = np.arctan2(df_corrected['rBy'].mean(), df_corrected['rBx'].mean())
         remote_tilt_angle_degrees = np.degrees(remote_tilt_angle)
@@ -1266,16 +1268,30 @@ def load_remote_reference_data(remote_site, remote_site_dir, start_datetime, end
     try:
         write_log(f"Loading remote reference data from {remote_site}")
         
-        # Map site names to their correct station identifiers
-        site_to_station_map = {
-            'HDD5449': 'EDL_',      # No number
-            'HDD5456': 'EDL04_',    # EDL04
-            'HDD5470': 'EDL03_',    # EDL03  
-            'HDD5974': 'EDL01_'     # EDL01
-        }
+        # Read the recorder.ini file from the remote site to get the correct station identifier
+        remote_recorder_ini = os.path.join(remote_site_dir, "config", "recorder.ini")
+        station_identifier = "EDL_"  # Default fallback
         
-        # Get the correct station identifier for this site
-        station_identifier = site_to_station_map.get(remote_site, 'EDL_')
+        if os.path.exists(remote_recorder_ini):
+            try:
+                import configparser
+                config = configparser.ConfigParser()
+                config.read(remote_recorder_ini)
+                
+                # Check both [recorder] and [Station] sections for station_long_identifier
+                if 'recorder' in config and 'station_long_identifier' in config['recorder']:
+                    station_identifier = config['recorder']['station_long_identifier']
+                    write_log(f"Read station identifier '{station_identifier}' from {remote_recorder_ini} [recorder] section")
+                elif 'Station' in config and 'station_long_identifier' in config['Station']:
+                    station_identifier = config['Station']['station_long_identifier']
+                    write_log(f"Read station identifier '{station_identifier}' from {remote_recorder_ini} [Station] section")
+                else:
+                    write_log(f"station_long_identifier not found in {remote_recorder_ini}, using default 'EDL_'", level="WARNING")
+            except Exception as e:
+                write_log(f"Error reading {remote_recorder_ini}: {e}, using default 'EDL_'", level="WARNING")
+        else:
+            write_log(f"recorder.ini not found at {remote_recorder_ini}, using default 'EDL_'", level="WARNING")
+        
         write_log(f"Using station identifier '{station_identifier}' for remote site {remote_site}")
         
         # Load remote reference GPS data
@@ -1324,7 +1340,7 @@ def load_remote_reference_data(remote_site, remote_site_dir, start_datetime, end
         bx_files = glob.glob(pattern, recursive=True)
         
         if not bx_files:
-            write_log(f"No BX files found in remote site {remote_site}", level="WARNING")
+            write_log(f"No BX files found in remote site {remote_site} using pattern '{station_identifier}*.BX'", level="WARNING")
             return None, None, None
         
         # Sort files to get the earliest one
@@ -1466,7 +1482,7 @@ class ProcessASCII:
     """
     
     def __init__(self, input_dir, param_file, average=False, perform_freq_analysis=False,
-                 plot_data=False, apply_smoothing=False, smoothing_window=2500, threshold_factor=10.0,
+                 plot_timeseries=False, apply_smoothing=False, smoothing_window=2500, threshold_factor=10.0,
                  plot_boundaries=True, plot_smoothed_windows=True, plot_coherence=False,
                  log_first_rows=False, smoothing_method="median", sens_start=0, sens_end=5000,
                  skip_minutes=[0, 0], apply_drift_correction=False, apply_rotation=False,
@@ -1482,7 +1498,7 @@ class ProcessASCII:
             param_file (str): Path to the parameter file (config/recorder.ini).
             average (bool): Whether to average the data (unused).
             perform_freq_analysis (bool): Whether to perform frequency analysis.
-            plot_data (bool): Whether to plot the data.
+            plot_timeseries (bool): Whether to plot the data.
             apply_smoothing (bool): Whether to apply smoothing.
             smoothing_window (int): Window size for smoothing.
             threshold_factor (float): Threshold factor for outlier detection.
@@ -1517,7 +1533,7 @@ class ProcessASCII:
         self.param_file = param_file
         self.average = average
         self.perform_freq_analysis = perform_freq_analysis
-        self.plot_data = plot_data
+        self.plot_timeseries = plot_timeseries
         self.apply_smoothing = apply_smoothing
         self.smoothing_window = smoothing_window
         self.threshold_factor = threshold_factor
@@ -1756,7 +1772,13 @@ class ProcessASCII:
             # Build time column
             sample_interval = self.metadata.get('sample_interval', 1.0)
             
-            # Find first file to extract start time
+            # Determine timezone handling
+            if isinstance(self.timezone, list):
+                main_timezone = self.timezone[0]
+            else:
+                main_timezone = self.timezone
+            
+            # Find BX files to extract start time
             station_identifier = self.metadata.get('station_long_identifier', 'EDL_')
             bx_files = glob.glob(os.path.join(self.input_dir, "**", f"{station_identifier}*.BX"), recursive=True)
             if not bx_files:
@@ -1777,16 +1799,24 @@ class ProcessASCII:
                         write_site_log(f"Applied GPS week rollover correction: {original_time} → {start_datetime}")
                     
                     # Convert timezone if requested
-                    if self.timezone[0] != "UTC":
+                    if main_timezone != "UTC":
                         try:
                             import pytz
                             utc_tz = pytz.UTC
-                            target_tz = pytz.timezone(self.timezone[0])
+                            target_tz = pytz.timezone(main_timezone)
                             start_datetime = utc_tz.localize(start_datetime).astimezone(target_tz)
+                            write_site_log(f"Converted start time to {main_timezone}: {start_datetime}")
                         except ImportError:
                             write_site_log(f"pytz not available, using UTC timezone", level="WARNING")
                         except Exception as e:
                             write_site_log(f"Error converting timezone: {e}, using UTC", level="WARNING")
+                    
+                    # Update summary metadata
+                    # Determine timezone handling
+                    if isinstance(self.timezone, list):
+                        main_timezone = self.timezone[0]
+                    else:
+                        main_timezone = self.timezone
                     
                     # Build datetime column
                     combined_raw_df['datetime'] = [
@@ -1839,7 +1869,11 @@ class ProcessASCII:
                 remote_ref_dir = os.path.join(os.path.dirname(self.input_dir), remote_ref_site)
                 
                 # Determine timezone for remote reference
-                remote_timezone = self.timezone[1] if len(self.timezone) > 1 else self.timezone[0]
+                if isinstance(self.timezone, list) and len(self.timezone) > 1:
+                    remote_timezone = self.timezone[1]
+                else:
+                    remote_timezone = main_timezone
+                write_site_log(f"Using timezone '{remote_timezone}' for remote reference site")
                 
                 if os.path.exists(remote_ref_dir):
                     remote_df, remote_gps_data, distance_km = load_remote_reference_data(
@@ -1850,13 +1884,14 @@ class ProcessASCII:
                     
                     if remote_df is not None and not remote_df.empty:
                         # Ensure both datasets have the same timezone before merging
-                        if len(self.timezone) > 1 and self.timezone[0] != self.timezone[1]:
+                        if isinstance(self.timezone, list) and len(self.timezone) > 1 and self.timezone[0] != self.timezone[1]:
                             # Convert remote reference to main site timezone
                             try:
                                 import pytz
                                 remote_tz = pytz.timezone(remote_timezone)
-                                main_tz = pytz.timezone(self.timezone[0])
+                                main_tz = pytz.timezone(main_timezone)
                                 remote_df['datetime'] = remote_df['datetime'].dt.tz_localize(remote_tz).dt.tz_convert(main_tz)
+                                write_site_log(f"Converted remote reference timezone from {remote_timezone} to {main_timezone}")
                             except Exception as e:
                                 write_site_log(f"Error converting remote reference timezone: {e}", level="WARNING")
                         
@@ -2042,12 +2077,13 @@ class ProcessASCII:
                 if 'rBx' in processed_df.columns:
                     output_columns.extend(['rBx', 'rBy'])
                 
-                output_df = processed_df[output_columns].copy()
+                output_df = pd.DataFrame(processed_df[output_columns].copy())
                 
                 # Add sample rate suffix to filename for all decimation factors
                 suffix = get_sample_rate_suffix(sample_interval)
-                # New naming: SITENAME_10Hz_Process.txt
-                filename = f"{self.site_name}{suffix}_Process.txt"
+                # New naming: CPU{pid}_{timestamp}_SITENAME_10Hz_Process.txt
+                cpu_prefix = get_cpu_prefix()
+                filename = f"{cpu_prefix}_{self.site_name}{suffix}_Process.txt"
                 processed_output_path = os.path.join(".", filename)
                 float_cols = output_df.select_dtypes(include=['float', 'float64', 'float32']).columns
                 output_df[float_cols] = output_df[float_cols].round(3)
@@ -2076,7 +2112,7 @@ class ProcessASCII:
             self.results['end_time'] = datetime.datetime.now()
             
             # Generate plots if requested
-            if self.plot_data:
+            if self.plot_timeseries:
                 write_site_log(f"Generating plots...")
                 
                 # Get sample rate suffix for plotting
@@ -2103,7 +2139,7 @@ class ProcessASCII:
                     xarm=self.metadata.get("xarm"),
                     yarm=self.metadata.get("yarm"),
                     skip_minutes=self.skip_minutes,
-                    timezone=self.timezone
+                    timezone=main_timezone
                 )
             
             # Perform frequency analysis if requested
@@ -2305,6 +2341,10 @@ class ProcessASCII:
             import shutil
             import traceback
             
+            write_site_log("=" * 60)
+            write_site_log("STARTING LEMIMT PROCESSING")
+            write_site_log("=" * 60)
+            
             # Enhanced platform detection and handling
             current_platform = platform.system()
             write_site_log(f"Platform detected: {current_platform}")
@@ -2316,17 +2356,26 @@ class ProcessASCII:
                 filename_only = os.path.basename(processed_file_path)
                 write_site_log(f"Command to run on Windows: {self.lemimt_path} -r -f {filename_only}", level="INFO")
                 
-                # Generate a batch script for easy execution on Windows
-                self._generate_windows_batch_script(processed_file_path, filename_only)
+                write_site_log("=" * 60)
+                write_site_log("LEMIMT PROCESSING SKIPPED (Non-Windows platform)")
+                write_site_log("=" * 60)
                 return False
             
             # Enhanced executable validation
+            write_site_log("Validating lemimt executable...")
             lemimt_path = self._validate_lemimt_executable()
             if not lemimt_path:
+                write_site_log("=" * 60)
+                write_site_log("LEMIMT PROCESSING FAILED (Invalid executable)")
+                write_site_log("=" * 60)
                 return False
             
             # Enhanced file validation
+            write_site_log("Validating input files...")
             if not self._validate_input_files(processed_file_path):
+                write_site_log("=" * 60)
+                write_site_log("LEMIMT PROCESSING FAILED (Invalid input files)")
+                write_site_log("=" * 60)
                 return False
             
             # Get working directory and ensure we're in the right place
@@ -2340,28 +2389,41 @@ class ProcessASCII:
             # Construct the command with enhanced options
             cmd = [lemimt_path, "-r", "-f", filename_only]
             write_site_log(f"Working directory: {working_dir}")
-            write_site_log(f"Running lemimt command: {' '.join(cmd)}")
+            write_site_log(f"Input file: {filename_only}")
+            write_site_log(f"Full command: {' '.join(cmd)}")
+            write_site_log("Preparing to execute lemimt...")
             
             # Enhanced subprocess execution with better error handling
             result = self._execute_lemimt_command(cmd, working_dir)
             
             if result['success']:
-                write_site_log(f"lemimt processing completed successfully")
+                write_site_log("=" * 60)
+                write_site_log("LEMIMT PROCESSING COMPLETED SUCCESSFULLY")
+                write_site_log("=" * 60)
+                write_site_log(f"Return code: {result.get('returncode', 'N/A')}")
                 if result.get('stdout'):
                     write_site_log(f"lemimt output: {result['stdout']}")
                 
                 # TODO: Uncomment the following lines to delete processed data and config files after lemimt processing
+                # write_site_log("Cleaning up processed files...")
                 # self._cleanup_processed_files(processed_file_path)
                 
                 return True
             else:
-                write_site_log(f"lemimt processing failed: {result.get('error', 'Unknown error')}", level="ERROR")
+                write_site_log("=" * 60)
+                write_site_log("LEMIMT PROCESSING FAILED")
+                write_site_log("=" * 60)
+                write_site_log(f"Error: {result.get('error', 'Unknown error')}")
+                write_site_log(f"Return code: {result.get('returncode', 'N/A')}")
                 if result.get('stderr'):
-                    write_site_log(f"lemimt stderr: {result['stderr']}", level="ERROR")
+                    write_site_log(f"lemimt stderr: {result['stderr']}")
                 return False
                 
         except Exception as e:
-            write_site_log(f"Unexpected error running lemimt: {e}", level="ERROR")
+            write_site_log("=" * 60)
+            write_site_log("LEMIMT PROCESSING FAILED (Unexpected error)")
+            write_site_log("=" * 60)
+            write_site_log(f"Error: {e}")
             write_site_log(f"Traceback: {traceback.format_exc()}", level="ERROR")
             return False
 
@@ -2495,60 +2557,6 @@ class ProcessASCII:
                 'returncode': -1
             }
 
-    def _generate_windows_batch_script(self, processed_file_path, filename_only):
-        """Generate a Windows batch script for easy lemimt execution."""
-        try:
-            batch_content = f"""@echo off
-echo Running lemimt processing for {filename_only}
-echo.
-
-REM Check if lemimt.exe exists
-if not exist "lemimt.exe" (
-    echo ERROR: lemimt.exe not found in current directory
-    echo Please ensure lemimt.exe is in the same directory as this batch file
-    pause
-    exit /b 1
-)
-
-REM Check if input file exists
-if not exist "{filename_only}" (
-    echo ERROR: Input file {filename_only} not found
-    echo Please ensure the processed data file is in the same directory
-    pause
-    exit /b 1
-)
-
-echo Found lemimt.exe and {filename_only}
-echo Running: lemimt.exe -r -f {filename_only}
-echo.
-
-REM Run lemimt
-lemimt.exe -r -f {filename_only}
-
-if %ERRORLEVEL% EQU 0 (
-    echo.
-    echo SUCCESS: lemimt processing completed successfully
-) else (
-    echo.
-    echo ERROR: lemimt processing failed with error code %ERRORLEVEL%
-)
-
-echo.
-pause
-"""
-            
-            batch_filename = f"run_lemimt_{os.path.splitext(filename_only)[0]}.bat"
-            batch_path = os.path.join(os.path.dirname(processed_file_path), batch_filename)
-            
-            with open(batch_path, 'w') as f:
-                f.write(batch_content)
-            
-            write_site_log(f"Generated Windows batch script: {batch_path}")
-            write_site_log(f"Transfer this file along with {filename_only} to a Windows machine")
-            
-        except Exception as e:
-            write_site_log(f"Error generating batch script: {e}", level="WARNING")
-
     def _cleanup_processed_files(self, processed_file_path):
         """Clean up processed data and config files after successful lemimt processing."""
         try:
@@ -2587,53 +2595,30 @@ def read_processing_config(processing_file="Processing.txt"):
         with open(processing_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # Skip header line if it exists (only if it contains "Site" or looks like a header)
-        start_line = 0
-        if lines and len(lines) > 0:
-            first_line = lines[0].strip().lower()
-            if first_line.startswith('site') or first_line.startswith('site,'):
-                start_line = 1
-                write_log(f"Skipping header line: {lines[0].strip()}")
-        
-        for line in lines[start_line:]:
+        # Skip header line if it exists (only if it looks like a header with column names)
+        for line in lines:
             line = line.strip()
-            if line and not line.startswith('#'):
-                parts = [part.strip() for part in line.split(',')]
-                
-                # Handle both 3-column and 4-column formats
-                if len(parts) >= 3:
-                    site = parts[0]
-                    try:
-                        xarm = float(parts[1])
-                        yarm = float(parts[2])
-                        
-                        # Set remote reference based on number of columns
-                        if len(parts) >= 4:
-                            remote_ref = parts[3]
-                        else:
-                            remote_ref = "None"  # No remote reference specified
-                        
-                        config[site] = {
-                            'xarm': xarm,
-                            'yarm': yarm,
-                            'remote_reference': remote_ref
-                        }
-                        
-                        write_log(f"Loaded config for {site}: xarm={xarm} m, yarm={yarm} m, remote_ref={remote_ref}")
-                        
-                    except ValueError as e:
-                        write_log(f"Error parsing numeric values for site {site}: {e}", level="WARNING")
-                        continue
-                else:
-                    write_log(f"Skipping invalid line (insufficient columns): {line}", level="WARNING")
-        
-        if not config:
-            write_log(f"No valid site configurations found in {processing_file}", level="WARNING")
-        else:
-            write_log(f"Successfully loaded {len(config)} site configurations from {processing_file}")
-        
+            if not line or line.startswith('#'):
+                continue
+            # Only skip if it's a header line with column names, not if it contains "site" in the site name
+            if line.lower().startswith('site,') or line.lower().startswith('site name,') or line.lower().startswith('site_name,'):
+                continue
+            parts = [part.strip() for part in line.split(',')]
+            if len(parts) == 4:
+                site, xarm, yarm, remote_ref = parts
+                config[site] = {
+                    'xarm': float(xarm),
+                    'yarm': float(yarm),
+                    'remote_reference': remote_ref
+                }
+            elif len(parts) == 3:
+                site, xarm, yarm = parts
+                config[site] = {
+                    'xarm': float(xarm),
+                    'yarm': float(yarm),
+                    'remote_reference': None
+                }
         return config
-        
     except FileNotFoundError:
         write_log(f"Processing.txt file not found: {processing_file}", level="WARNING")
         return {}
@@ -2678,6 +2663,43 @@ def decimal_degrees_to_degrees_minutes(decimal_degrees, is_latitude=True):
     
     # Format: "DD MM.MMMMMM,H"
     return f"{degrees} {minutes:.5f},{hemisphere}"
+
+
+def get_cpu_prefix():
+    """Get a worker number prefix for output files to prevent overwriting.
+    
+    Returns:
+        str: A worker prefix based on the current worker number (P01_, P02_, etc.).
+    """
+    import os
+    import threading
+    
+    # First check for environment variable (set by batch processing)
+    worker_num = os.environ.get('WORKER_NUM')
+    if worker_num:
+        try:
+            return f"P{int(worker_num):02d}_"
+        except ValueError:
+            pass
+    
+    # Get the current thread name to determine worker number
+    thread_name = threading.current_thread().name
+    
+    # Extract worker number from thread name (e.g., "ThreadPoolExecutor-0_0" -> "01")
+    if "ThreadPoolExecutor" in thread_name:
+        # ThreadPoolExecutor uses format like "ThreadPoolExecutor-0_0", "ThreadPoolExecutor-0_1", etc.
+        try:
+            # Extract the worker number from the thread name
+            parts = thread_name.split('_')
+            if len(parts) >= 2:
+                worker_num = int(parts[-1]) + 1  # Convert to 1-based indexing
+                return f"P{worker_num:02d}_"
+        except (ValueError, IndexError):
+            pass
+    
+    # Fallback: use process ID if we can't determine worker number
+    pid = os.getpid()
+    return f"P{pid:02d}_"
 
 
 def get_next_available_identifier(base_site_name, output_dir="."):
@@ -2756,6 +2778,9 @@ def get_file_number(file_index):
 def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
                               remote_reference_site=None, output_file_path=None, run_index=None, file_index=0):
     """Generate a processing configuration file with a letter-number identifier (e.g., A00, A01, B00)."""
+    # Get CPU prefix to prevent file overwriting
+    cpu_prefix = get_cpu_prefix()
+    
     if output_file_path:
         config_path = os.path.splitext(output_file_path)[0] + ".cfg"
     else:
@@ -3936,13 +3961,13 @@ NOISE DETECTION RESULTS:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process MT ASCII data files for a given site.")
-    parser.add_argument("--input_dir", required=True, help="Directory containing ASCII data files.")
+    parser.add_argument("--site_name", required=True, help="Site name (directory containing ASCII data files).")
     parser.add_argument("--param_file", default="config/recorder.ini", help="Path to the parameter file (default: config/recorder.ini)")
     parser.add_argument("--average", action="store_true", help="Average values over intervals.")
     parser.add_argument("--perform_freq_analysis", nargs="?", const="W", metavar="METHODS",
                         help="Perform frequency analysis. Use W for Welch, M for Multi-taper, S for Spectrogram. "
                              "Combine them: 'WMS' for all three, 'WM' for Welch + Multi-taper, etc. Default: W")
-    parser.add_argument("--plot_data", action="store_true", help="Display physical channel plots.")
+    parser.add_argument("--plot_timeseries", action="store_true", help="Display physical channel plots.")
     parser.add_argument("--apply_smoothing", action="store_true", help="Apply smoothing to the data.")
     parser.add_argument("--smoothing_window", type=int, default=2500, help="Window size for smoothing.")
     parser.add_argument("--threshold_factor", type=float, default=10.0, help="Threshold multiplier for outlier detection.")
@@ -3957,70 +3982,49 @@ if __name__ == "__main__":
     parser.add_argument("--plot_tilt", action="store_true", help="Plot tilt-corrected data in timeseries (default: False)")
     parser.add_argument("--timezone", nargs="+", default=["UTC"], 
                         help="Timezone(s) for the data. Use one timezone for both sites (e.g., 'Australia/Adelaide') or two timezones for main and remote sites (e.g., 'Australia/Adelaide' 'UTC')")
-    parser.add_argument("--plot_original_data", action="store_true", help="Plot original data alongside corrected data (default: False)")
-    parser.add_argument("--smoothing_method", default="median",
-                        choices=["median", "adaptive"],
-                        help="Smoothing method to use: 'median' for median/MAD, 'adaptive' for adaptive median filtering")
-    parser.add_argument("--tilt_correction", nargs='?', const=True, metavar='RR', 
-                        help="Apply tilt correction so that mean(By) is zero. Use 'RR' to also apply to remote reference channels.")
-    parser.add_argument("--sens_start", type=int, default=0, help="(Unused) Start sample index for sensitivity test")
-    parser.add_argument("--sens_end", type=int, default=5000, help="(Unused) End sample index for sensitivity test")
-    parser.add_argument("--skip_minutes", nargs=2, type=int, default=[0, 0], metavar=('START', 'END'),
-                        help="Minutes to skip from start and end of data (e.g., '30 20' skips first 30 and last 20 minutes)")
-    parser.add_argument("--save_plots", action="store_true", help="Save plots to files instead of displaying them")
-    parser.add_argument("--save_raw_data", action="store_true", default=False, help="Save raw (unprocessed) data to file")
-    parser.add_argument("--save_processed_data", action="store_true", default=False, help="Save processed data to file")
-    parser.add_argument("--remote_reference", type=str, default=None,
-                        help="Site name to use as remote reference (only Bx and By will be loaded and merged as rBx, rBy)")
-    parser.add_argument("--decimate", nargs="+", type=int, default=None,
-                        help="Decimation factors to apply (e.g., '2 5 10' for 2x, 5x, 10x decimation). Each factor will create separate output files with sample rate suffix.")
-    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Log level for output (default: INFO)")
-    parser.add_argument("--run_lemimt", action="store_true", default=False,
-                        help="Run lemimt.exe on the processed output file after processing is complete")
-    parser.add_argument("--lemimt_path", type=str, default="lemimt.exe",
-                        help="Full path to the lemimt.exe executable (default: lemimt.exe in current directory)")
-    parser.add_argument("--apply_filtering", action="store_true", default=False,
-                        help="Apply frequency filtering to remove unwanted frequency components")
-    parser.add_argument("--filter_type", type=str, default="comb", 
-                        choices=["comb", "bandpass", "highpass", "lowpass", "adaptive", "custom"],
-                        help="Type of filter to apply (default: comb for powerline noise removal)")
-    parser.add_argument("--filter_channels", nargs="+", default=None,
-                        help="Channels to filter (default: all main channels Bx, By, Bz, Ex, Ey)")
-    parser.add_argument("--filter_notch_freq", type=float, default=50.0,
-                        help="Notch frequency for comb filter (default: 50 Hz for powerline)")
-    parser.add_argument("--filter_quality_factor", type=float, default=30.0,
-                        help="Quality factor for comb filter (higher = narrower notch, default: 30)")
-    parser.add_argument("--filter_harmonics", nargs="+", type=float, default=None,
-                        help="Specific harmonic frequencies to notch (default: first 5 harmonics)")
-    parser.add_argument("--filter_low_freq", type=float, default=0.1,
-                        help="Lower cutoff frequency for bandpass filter (default: 0.1 Hz)")
-    parser.add_argument("--filter_high_freq", type=float, default=10.0,
-                        help="Upper cutoff frequency for bandpass filter (default: 10.0 Hz)")
-    parser.add_argument("--filter_cutoff_freq", type=float, default=0.1,
-                        help="Cutoff frequency for highpass/lowpass filters (default: 0.1 Hz)")
-    parser.add_argument("--filter_order", type=int, default=4,
-                        help="Filter order for Butterworth filters (default: 4)")
-    parser.add_argument("--filter_reference_channel", type=str, default="rBx",
-                        help="Reference channel for adaptive filtering (default: rBx)")
-    parser.add_argument("--filter_length", type=int, default=64,
-                        help="Filter length for adaptive filtering (default: 64)")
-    parser.add_argument("--filter_mu", type=float, default=0.01,
-                        help="Step size for adaptive filtering (default: 0.01)")
-    parser.add_argument("--filter_method", type=str, default="filtfilt",
-                        choices=["filtfilt", "lfilter"],
-                        help="Filtering method: filtfilt (zero-phase) or lfilter (causal, default: filtfilt)")
-    parser.add_argument("--plot_heatmaps", action="store_true", help="Generate heatmap plots for quality control.")
-    parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="Number of points per segment for heatmap FFT.")
-    parser.add_argument("--heatmap_noverlap", type=int, help="Number of points to overlap between heatmap segments.")
-    parser.add_argument("--heatmap_thresholds", type=str, help="Custom coherence thresholds for heatmap quality scoring.")
-
+    parser.add_argument("--plot_original_data", action="store_true", help="Plot original data alongside corrected data.")
+    parser.add_argument("--save_raw_data", action="store_true", help="Save raw data to file.")
+    parser.add_argument("--remote_reference", help="Remote reference site name for processing.")
+    parser.add_argument("--apply_filtering", action="store_true", help="Apply frequency filtering to the data.")
+    parser.add_argument("--filter_type", choices=["comb", "bandpass", "highpass", "lowpass", "adaptive"], 
+                        default="comb", help="Type of filter to apply.")
+    parser.add_argument("--filter_channels", nargs="+", help="Specific channels to filter (default: all channels).")
+    parser.add_argument("--filter_notch_freq", type=float, default=50.0, help="Notch frequency for comb filter (Hz).")
+    parser.add_argument("--filter_quality_factor", type=float, default=30.0, help="Quality factor for comb filter.")
+    parser.add_argument("--filter_harmonics", nargs="+", type=float, help="Specific harmonics to notch (default: auto-detect).")
+    parser.add_argument("--filter_low_freq", type=float, help="Low frequency cutoff for bandpass filter (Hz).")
+    parser.add_argument("--filter_high_freq", type=float, help="High frequency cutoff for bandpass filter (Hz).")
+    parser.add_argument("--filter_cutoff_freq", type=float, help="Cutoff frequency for highpass/lowpass filter (Hz).")
+    parser.add_argument("--filter_order", type=int, default=4, help="Filter order (higher = sharper cutoff).")
+    parser.add_argument("--filter_reference_channel", help="Reference channel for adaptive filtering.")
+    parser.add_argument("--filter_length", type=int, default=64, help="Filter length for adaptive filtering.")
+    parser.add_argument("--filter_mu", type=float, default=0.01, help="Step size for adaptive filtering.")
+    parser.add_argument("--filter_method", choices=["filtfilt", "lfilter"], default="filtfilt", 
+                        help="Filtering method (filtfilt=zero-phase, lfilter=causal).")
+    parser.add_argument("--plot_heatmaps", action="store_true", help="Generate coherence heatmaps for quality control.")
+    parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="FFT segment length for heatmaps.")
+    parser.add_argument("--heatmap_noverlap", type=int, help="Overlap between FFT segments for heatmaps.")
+    parser.add_argument("--heatmap_thresholds", help="Comma-separated coherence thresholds for heatmaps (e.g., '0.9,0.7,0.7').")
+    parser.add_argument("--smoothing_method", choices=["median", "adaptive"], default="median", 
+                        help="Smoothing method to use.")
+    parser.add_argument("--sens_start", type=int, default=0, help="Start sensor index for processing.")
+    parser.add_argument("--sens_end", type=int, default=5000, help="End sensor index for processing.")
+    parser.add_argument("--skip_minutes", nargs=2, type=int, default=[0, 0], 
+                        help="Skip first and last N minutes of data (e.g., --skip_minutes 10 20).")
+    parser.add_argument("--tilt_correction", action="store_true", help="Apply tilt correction to make mean(By) = 0.")
+    parser.add_argument("--decimate", nargs="+", type=int, help="Decimation factors to apply (e.g., --decimate 2 5 10).")
+    parser.add_argument("--run_lemimt", action="store_true", help="Run lemimt processing after data processing.")
+    parser.add_argument("--lemimt_path", default="lemimt.exe", help="Path to lemimt executable.")
+    
     args = parser.parse_args()
     
     # Set up logging
-    set_log_level(args.log_level)
+    set_log_level("INFO")
+    set_batch_mode(False)
+    set_site_name(args.site_name)
     
-    # Process the site
+    write_log(f"Starting processing for site: {args.site_name}")
+    
     # Determine decimation factors to process
     if args.decimate:
         decimation_factors = [1] + args.decimate  # Always include original (factor 1)
@@ -4031,10 +4035,9 @@ if __name__ == "__main__":
 
     # --- Two-letter identifier system ---
     # Determine the run letter for this script run (use first decimation's output as base)
-    site_name = os.path.basename(args.input_dir)
     sample_interval = 0.1  # Default, will be updated below
     # Build base_site_name for identifier search
-    base_site_name = f"MT_{site_name}"
+    base_site_name = f"MT_{args.site_name}"
     if args.remote_reference:
         base_site_name += f"_RR-{args.remote_reference}"
     # Use the highest sample rate for the base name (original data)
@@ -4049,15 +4052,17 @@ if __name__ == "__main__":
 
     # Process each decimation factor
     for file_index, decimation_factor in enumerate(decimation_factors):
-        write_log(f"Processing with decimation factor: {decimation_factor}")
+        write_log(f"Processing {args.site_name} with decimation factor: {decimation_factor}")
+        if args.remote_reference:
+            write_log(f"Using remote reference: {args.remote_reference}")
         
         # Create processor for this decimation factor
         processor = ProcessASCII(
-            input_dir=args.input_dir,
-            param_file="config/recorder.ini",  # Use default path
+            input_dir=args.site_name,  # Use site_name as directory
+            param_file=args.param_file,
             average=args.average,
             perform_freq_analysis=args.perform_freq_analysis,
-            plot_data=args.plot_data,
+            plot_timeseries=args.plot_timeseries,
             apply_smoothing=args.apply_smoothing,
             smoothing_window=args.smoothing_window,
             threshold_factor=args.threshold_factor,
@@ -4077,7 +4082,7 @@ if __name__ == "__main__":
             timezone=args.timezone,
             plot_original_data=args.plot_original_data,
             save_raw_data=args.save_raw_data,
-            save_processed_data=args.save_processed_data,
+            save_processed_data=True,  # Always save processed data
             remote_reference=args.remote_reference,
             apply_filtering=args.apply_filtering,
             filter_type=args.filter_type,
@@ -4100,8 +4105,12 @@ if __name__ == "__main__":
             heatmap_noverlap=args.heatmap_noverlap,
             heatmap_thresholds=args.heatmap_thresholds
         )
+        
+        # Set tilt correction to always apply to all Bx/By channels
         processor.tilt_correction = args.tilt_correction
-        processor.save_plots = args.save_plots
+        
+        # Always save plots when plotting
+        processor.save_plots = args.plot_timeseries
         
         # Store decimation factor for use in processing
         processor.decimation_factor = decimation_factor
@@ -4114,18 +4123,19 @@ if __name__ == "__main__":
         processor.process_all_files()
         
         # Run lemimt processing if requested
-        if args.run_lemimt and args.save_processed_data:
+        if args.run_lemimt:
             # Determine the filename based on decimation factor using new naming convention
+            cpu_prefix = get_cpu_prefix()
             if decimation_factor == 1:
-                processed_file = os.path.join(".", f"{site_name}_10Hz_Process.txt")
+                processed_file = os.path.join(".", f"{cpu_prefix}_{args.site_name}_10Hz_Process.txt")
             else:
                 sample_interval = processor.metadata.get("sample_interval", 0.1)
                 suffix = get_sample_rate_suffix(sample_interval * decimation_factor)
-                processed_file = os.path.join(".", f"{site_name}{suffix}_Process.txt")
+                processed_file = os.path.join(".", f"{cpu_prefix}_{args.site_name}{suffix}_Process.txt")
             # Check if the file exists, if not try alternative naming patterns
             if not os.path.exists(processed_file):
                 import glob
-                pattern = os.path.join(".", f"{site_name}*_Process.txt")
+                pattern = os.path.join(".", f"{cpu_prefix}_{args.site_name}*_Process.txt")
                 matching_files = glob.glob(pattern)
                 if matching_files:
                     processed_file = matching_files[0]
@@ -4146,7 +4156,7 @@ if __name__ == "__main__":
                         write_log(f"WARNING: No valid GPS data available for config generation, using defaults", level="WARNING")
                         write_log(f"GPS data available: {list(gps_data.keys()) if gps_data else 'None'}")
                     config_file = generate_processing_config(
-                        site_name=site_name,
+                        site_name=args.site_name,
                         gps_data=gps_data,
                         sample_interval=sample_interval,
                         has_remote_reference=has_remote_reference,
@@ -4168,344 +4178,33 @@ if __name__ == "__main__":
         write_log(f"Completed processing for decimation factor: {decimation_factor}")
     write_log("All decimation processing completed")
 
-"""
-Example usage:
-
-# BASIC PROCESSING EXAMPLES
-# =========================
-
-# Basic processing with plotting and saving plots:
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots
-
-# Basic processing with data saving (both raw and processed):
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_raw_data --save_processed_data
-
-# Basic processing with only processed data saving:
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data
-
-# Basic processing with only raw data saving:
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_raw_data
-
-# SMOOTHING EXAMPLES
-# ==================
-
-# Median smoothing with default settings:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --save_plots --save_processed_data
-
-# Adaptive median filtering:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_method adaptive --save_plots --save_processed_data
-
-# Custom smoothing window and threshold:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_window 1000 --threshold_factor 5.0 --save_plots --save_processed_data
-
-# CORRECTION EXAMPLES
-# ===================
-
-# Drift correction only:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --plot_drift --save_plots --save_processed_data
-
-# Rotation correction only:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_rotation --plot_rotation --save_plots --save_processed_data
-
-# Tilt correction only:
-python EDL_Process.py --input_dir HDD5449 --plot_data --tilt_correction --plot_tilt --save_plots --save_processed_data
-
-# Tilt correction including remote reference channels:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --tilt_correction RR --plot_tilt --save_plots --save_processed_data
-
-# Combined corrections (drift + rotation):
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --save_plots --save_processed_data
-
-# Combined corrections (drift + rotation + tilt):
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --save_plots --save_processed_data
-
-# Combined corrections (drift + rotation + tilt with remote reference):
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --apply_drift_correction --apply_rotation --tilt_correction RR --plot_drift --plot_rotation --plot_tilt --save_plots --save_processed_data
-
-# COMPARISON PLOTTING EXAMPLES
-# ============================
-
-# Plot original data alongside tilt-corrected data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --tilt_correction --plot_tilt --plot_original_data --save_plots --save_processed_data
-
-# Plot original data alongside drift-corrected data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --plot_drift --plot_original_data --save_plots --save_processed_data
-
-# Plot original data alongside rotated data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_rotation --plot_rotation --plot_original_data --save_plots --save_processed_data
-
-# TIMEZONE EXAMPLES
-# =================
-
-# Process with single timezone for both sites (Australia/Adelaide):
-python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "Australia/Adelaide" --save_plots --save_processed_data
-
-# Process with single timezone for both sites (America/New_York):
-python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "America/New_York" --save_plots --save_processed_data
-
-# Process with different timezones for main and remote sites:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --timezone "Australia/Adelaide" "UTC" --save_plots --save_processed_data
-
-# Process with timezone conversion and corrections:
-python EDL_Process.py --input_dir HDD5449 --plot_data --timezone "Australia/Adelaide" --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data
-
-# DATA SKIPPING EXAMPLES
-# ======================
-
-# Skip first 10 minutes of data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 10 0 --save_plots --save_processed_data
-
-# Skip last 20 minutes of data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 0 20 --save_plots --save_processed_data
-
-# Skip first 30 minutes and last 20 minutes of data:
-python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 30 20 --save_plots --save_processed_data
-
-# Skip first 30 minutes with corrections:
-python EDL_Process.py --input_dir HDD5449 --plot_data --skip_minutes 30 0 --apply_drift_correction --tilt_correction --save_plots --save_processed_data
-
-# FREQUENCY ANALYSIS EXAMPLES
-# ===========================
-
-# Basic frequency analysis (Welch spectra only - default):
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis --save_plots
-
-# Welch spectral analysis only:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis W --save_plots
-
-# Multi-taper spectral analysis only:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis M --save_plots
-
-# Spectrogram analysis only:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis S --save_plots
-
-# Welch + Multi-taper analysis:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WM --save_plots
-
-# Welch + Spectrogram analysis:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WS --save_plots
-
-# Multi-taper + Spectrogram analysis:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis MS --save_plots
-
-# All three methods (Welch + Multi-taper + Spectrogram):
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WMS --save_plots
-
-# Frequency analysis with corrections:
-python EDL_Process.py --input_dir HDD5449 --perform_freq_analysis WMS --apply_drift_correction --apply_rotation --save_plots
-
-# Frequency analysis with remote reference:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --perform_freq_analysis WMS --save_plots
-
-# COHERENCE ANALYSIS EXAMPLES
-# ===========================
-
-# Plot MT-specific coherence (Bx-Ey, By-Ex):
-python EDL_Process.py --input_dir HDD5449 --plot_coherence --save_plots
-
-# Coherence with remote reference (includes Bx-rBx, By-rBy, etc.):
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_coherence --save_plots
-
-# Coherence with corrections:
-python EDL_Process.py --input_dir HDD5449 --plot_coherence --apply_drift_correction --apply_rotation --save_plots
-
-# ADVANCED COMBINATIONS
-# =====================
-
-# Full processing pipeline with all corrections, smoothing, and analysis:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --plot_coherence --plot_drift --plot_rotation --plot_tilt --plot_original_data --timezone "Australia/Sydney" --skip_minutes 5 --save_plots --save_raw_data --save_processed_data
-
-# Processing with custom smoothing parameters:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_smoothing --smoothing_window 500 --threshold_factor 3.0 --smoothing_method median --plot_boundaries --plot_smoothed_windows --save_plots --save_processed_data
-
-# Processing with all corrections but no smoothing:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_original_data --save_plots --save_processed_data
-
-# MINIMAL PROCESSING EXAMPLES
-# ===========================
-
-# Just plot the data without any corrections or saving:
-python EDL_Process.py --input_dir HDD5449 --plot_data
-
-# Just save processed data without plotting:
-python EDL_Process.py --input_dir HDD5449 --save_processed_data
-
-# Just save raw data without plotting:
-python EDL_Process.py --input_dir HDD5449 --save_raw_data
-
-# DEBUGGING EXAMPLES
-# ==================
-
-# Log first few rows from each file for debugging:
-python EDL_Process.py --input_dir HDD5449 --log_first_rows --plot_data --save_plots
-
-# Process with detailed logging and all options:
-python EDL_Process.py --input_dir HDD5449 --log_first_rows --plot_data --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --perform_freq_analysis WMS --plot_coherence --plot_drift --plot_rotation --plot_tilt --plot_original_data --plot_boundaries --plot_smoothed_windows --save_plots --save_raw_data --save_processed_data
-
-# BATCH PROCESSING EXAMPLES
-# =========================
-
-# For batch processing multiple sites, use EDL_Batch.py:
-python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data
-
-# Batch processing with corrections:
-python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data
-
-# DECIMATION EXAMPLES
-# ===================
-
-# Process with 2x decimation (5 Hz output):
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --decimate 2
-
-# Process with multiple decimation factors (10 Hz, 5 Hz, 2 Hz, 1 Hz):
-python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --decimate 2 5 10
-
-# Decimation with corrections:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_plots --save_processed_data --decimate 2 5
-
-# Decimation with remote reference:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_data --save_plots --save_processed_data --decimate 2 5 10
-
-# NOTES:
-# - GPS coordinates and field strengths are automatically displayed in the plot
-# - Raw data contains the original ASCII values before conversion to physical units
-# - Processed data contains the final corrected values in physical units
-# - Plots show GPS coordinates (bottom left) and field strengths (bottom right)
-# - All data files are saved to outputs/[site_name]/ directory
-# - Use --save_plots to save plots instead of displaying them
-# - Use --save_raw_data and/or --save_processed_data to control data file output
-# - lemimt.exe processing is only available on Windows systems
-# - For non-Windows systems, the command to run lemimt will be logged for manual execution
-
-# LEMIMT PROCESSING EXAMPLES
-# ==========================
-
-# Basic lemimt processing (requires Windows):
-python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt
-
-# lemimt processing with custom executable path:
-python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt --lemimt_path "C:/Program Files/lemimt/lemimt.exe"
-
-# lemimt processing with full processing pipeline:
-python EDL_Process.py --input_dir HDD5449 --plot_data --apply_drift_correction --apply_rotation --tilt_correction --save_processed_data --run_lemimt
-
-# lemimt processing with decimation:
-python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt --decimate 2 5
-
-# lemimt processing with remote reference:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --save_processed_data --run_lemimt
-
-# FREQUENCY FILTERING EXAMPLES
-# ============================
-
-# Basic comb filter for powerline noise removal (50 Hz and harmonics):
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --plot_data --save_plots --save_processed_data
-
-# Comb filter with custom notch frequency (60 Hz for US powerline):
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_notch_freq 60.0 --plot_data --save_plots --save_processed_data
-
-# Comb filter with custom quality factor (narrower notch):
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_quality_factor 50.0 --plot_data --save_plots --save_processed_data
-
-# Comb filter with specific harmonics only:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_harmonics 50 100 150 --plot_data --save_plots --save_processed_data
-
-# Bandpass filter for specific frequency range:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --plot_data --save_plots --save_processed_data
-
-# Highpass filter to remove DC and low-frequency drift:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type highpass --filter_cutoff_freq 0.001 --plot_data --save_plots --save_processed_data
-
-# Lowpass filter to remove high-frequency noise:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type lowpass --filter_cutoff_freq 5.0 --plot_data --save_plots --save_processed_data
-
-# Filter with custom order (higher order = sharper cutoff):
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.1 --filter_high_freq 10.0 --filter_order 8 --plot_data --save_plots --save_processed_data
-
-# Filter specific channels only:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_channels Bx By --plot_data --save_plots --save_processed_data
-
-# Adaptive filtering using remote reference (requires remote reference):
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_reference_channel rBx --plot_data --save_plots --save_processed_data
-
-# Adaptive filtering with custom parameters:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_length 128 --filter_mu 0.005 --plot_data --save_plots --save_processed_data
-
-# Use causal filtering instead of zero-phase (may introduce phase shifts):
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_method lfilter --plot_data --save_plots --save_processed_data
-
-# Filtering with other corrections:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots --save_processed_data
-
-# Filtering with smoothing:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_smoothing --smoothing_method median --plot_data --save_plots --save_processed_data
-
-# Filtering with frequency analysis to see the effect:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --perform_freq_analysis WMS --plot_data --save_plots --save_processed_data
-
-# Filtering with decimation:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --decimate 2 5 --plot_data --save_plots --save_processed_data
-
-# ADVANCED FILTERING COMBINATIONS
-# ===============================
-
-# Multi-stage filtering: comb filter + bandpass
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_notch_freq 50.0 --plot_data --save_plots --save_processed_data
-
-# Filtering for different frequency bands (run multiple times with different parameters):
-# First: Remove powerline noise
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --save_processed_data
-# Then: Apply bandpass filter to the filtered output
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --save_processed_data
-
-# Filtering with remote reference and adaptive filtering:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_reference_channel rBx --filter_length 64 --filter_mu 0.01 --plot_data --save_plots --save_processed_data
-
-# NOTES ON FILTERING:
-# - Comb filters are ideal for removing powerline noise (50 Hz in Europe/Australia, 60 Hz in US)
-# - Bandpass filters are useful for focusing on specific frequency ranges of interest
-# - Highpass filters remove DC offset and low-frequency drift
-# - Lowpass filters remove high-frequency noise and aliasing
-# - Adaptive filtering requires a reference signal (usually remote reference)
-# - Zero-phase filtering (filtfilt) preserves signal timing but may have edge effects
-# - Causal filtering (lfilter) may introduce phase shifts but has no edge effects
-# - Higher filter orders provide sharper cutoffs but may introduce ringing
-# - Always check the filter response plots to ensure the filter is working as expected
-# - Consider the Nyquist frequency (fs/2) when setting filter frequencies
-# - For MT data, typical frequency ranges of interest are 0.001-10 Hz
-
-# HEATMAP EXAMPLES
-# ================
-
-# Basic heatmap generation for quality control:
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --save_plots --save_processed_data
-
-# Heatmap with custom FFT parameters:
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --heatmap_nperseg 2048 --heatmap_noverlap 1024 --save_plots --save_processed_data
-
-# Heatmap with custom coherence thresholds:
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.7" --save_plots --save_processed_data
-
-# Heatmap with remote reference:
-python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_heatmaps --save_plots --save_processed_data
-
-# Heatmap with filtering and corrections:
-python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_heatmaps --save_plots --save_processed_data
-
-# Heatmap with frequency analysis:
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --perform_freq_analysis WMS --plot_coherence --save_plots --save_processed_data
-
-# Heatmap with decimation:
-python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --decimate 2 5 --save_plots --save_processed_data
-
-# NOTES ON HEATMAPS:
-# - Coherence heatmaps show period vs. time with coherence as color (red=low, green=high)
-# - Window score barcodes show quality indicators aligned with heatmaps (green=good, amber=fair, red=poor)
-# - Coherence histograms show distribution of coherence values across frequency bands
-# - Vertical stripes in heatmaps often indicate cultural noise (powerlines, machinery, etc.)
-# - Low coherence regions can indicate data quality issues or cultural interference
-# - Use heatmaps for field quality control and identifying problematic time periods
-# - Custom thresholds allow adjustment based on survey conditions and data quality
-# - Larger FFT segments provide better frequency resolution but less time resolution
-# - Overlap between segments affects smoothness of the heatmap display
-"""
+# NOTES ON PROCESSING.TXT CONFIGURATION:
+# - Use EDL_Batch.py --input_config to process all sites from Processing.txt
+# - The file should be in the format: Site, xarm, yarm, [remote_ref1; remote_ref2]
+# - Multiple remote references in brackets will create multiple processing runs
+# - Dipole lengths (xarm, yarm) are automatically applied from the configuration
+# - Remote references are automatically loaded and processed
+# - Each remote reference creates a separate output file with unique CPU prefix
+# - EDL_Process.py is focused on single-site processing only
+
+# EXAMPLE USAGE:
+# 
+# Single site processing:
+# python EDL_Process.py --site_name SiteA-50m --plot_timeseries --tilt_correction
+# python EDL_Process.py --site_name SiteB-50m --remote_reference SiteD-10m --plot_timeseries
+# python EDL_Process.py --site_name SiteC-10m --apply_smoothing --plot_timeseries --run_lemimt
+# 
+# Batch processing (multiple sites):
+# python EDL_Batch.py --input_config --max_workers 4 --plot_timeseries --tilt_correction
+# python EDL_Batch.py --input_config --max_workers 2 --run_lemimt
+# 
+# Advanced processing:
+# python EDL_Process.py --site_name SiteA-50m --plot_timeseries --apply_filtering --filter_type comb --filter_notch_freq 50.0
+# python EDL_Process.py --site_name SiteB-50m --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.5"
+# python EDL_Process.py --site_name SiteC-10m --decimate 2 5 10 --plot_timeseries
+# 
+# Processing.txt format example:
+# SiteA-50m,100.0,100.0,SiteD-10m
+# SiteB-50m,100.0,100.0,[SiteC-10m; SiteD-10m]
+# SiteC-10m,50.0,50.0,
+# SiteD-10m,50.0,50.0,SiteA-50m

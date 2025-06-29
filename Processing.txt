@@ -1,0 +1,4 @@
+SiteA-50m, 45, 50, SiteD-10m
+SiteB-50m, 45, 50, [SiteC-10m; SiteD-10m]
+SiteC-10m, 10, 10, 
+SiteD-10m, 10, 10, [SiteA-50m; SiteB-50m; SiteC-10m]

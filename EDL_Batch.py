@@ -1,101 +1,92 @@
 #!/usr/bin/env python3
 """
-EDL Batch Processing Script
+Batch Process MT Data in Parallel
 
-This script processes multiple EDL sites in parallel using multiprocessing.
+This script processes multiple magnetotelluric (MT) sites in batch mode using Processing.txt configuration.
+Each site is assumed to be in its own folder (named after the site) contained within a parent directory.
 For each site, a ProcessASCII instance (from EDL_Process.py) is created and run in parallel
-to handle the processing of ASCII data files.
+using a ThreadPoolExecutor. Output files and figures are named using the site folder name.
 
-Usage:
-    python EDL_Batch.py --sites HDD5449,HDD5456,HDD5470 --parent_dir . --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots
-    
-    OR using a configuration file:
-    python EDL_Batch.py --config_file Processing.txt --parent_dir . --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots
-
-Author: [Your Name]
-Date: [Date]
+Usage example:
+    python EDL_Batch.py --input_config --max_workers 4 --plot_timeseries --tilt_correction
+    python EDL_Batch.py --input_config --max_workers 2 --run_lemimt
 """
 
-import argparse
 import os
-import sys
+import argparse
+import concurrent.futures
 import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# Import the processing module
-from EDL_Process import ProcessASCII, write_log, write_batch_log, write_site_log, set_batch_mode, set_log_level, create_batch_summary, read_processing_config
+import sys
+import subprocess
+from EDL_Process import ProcessASCII, write_log, write_batch_log, set_batch_mode, set_log_level, create_batch_summary, read_processing_config
 
 def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation, tilt_correction,
                         apply_smoothing, smoothing_method, smoothing_window,
-                        threshold_factor, plot_data, plot_boundaries,
+                        threshold_factor, plot_timeseries, plot_boundaries,
                         plot_smoothed_windows, plot_coherence, perform_freq_analysis,
-                        log_first_rows, sens_start, sens_end, skip_minutes, save_plots,
+                        log_first_rows, sens_start, sens_end, skip_minutes,
                         plot_drift, plot_rotation, plot_tilt, timezone, plot_original_data,
-                        save_processed_data, remote_reference=None, apply_filtering=False,
+                        remote_reference=None, apply_filtering=False,
                         filter_type="comb", filter_channels=None, filter_params=None,
                         plot_heatmaps=False, heatmap_nperseg=1024, heatmap_noverlap=None, heatmap_thresholds=None,
-                        site_config=None, run_lemimt=False, lemimt_path="lemimt.exe"):
-    """Process a single site with the given parameters.
+                        run_lemimt=False, lemimt_path="lemimt.exe"):
+    """
+    Processes a single site folder.
     
     Args:
-        site (str): Site name to process
-        parent_dir (str): Parent directory containing site folders
-        apply_drift_correction (bool): Whether to apply drift correction
-        apply_rotation (bool): Whether to apply rotation correction
-        tilt_correction (bool): Whether to apply tilt correction
-        apply_smoothing (bool): Whether to apply smoothing
-        smoothing_method (str): Smoothing method to use
-        smoothing_window (int): Smoothing window size
-        threshold_factor (float): Threshold factor for smoothing
-        plot_data (bool): Whether to plot data
-        plot_boundaries (bool): Whether to plot file boundaries
-        plot_smoothed_windows (bool): Whether to plot smoothed windows
-        plot_coherence (bool): Whether to plot coherence
-        perform_freq_analysis (str): Frequency analysis options
-        log_first_rows (bool): Whether to log first rows
-        sens_start (int): Sensor start index
-        sens_end (int): Sensor end index
-        skip_minutes (list): Minutes to skip from start and end
-        save_plots (bool): Whether to save plots
-        plot_drift (bool): Whether to plot drift correction
-        plot_rotation (bool): Whether to plot rotation correction
-        plot_tilt (bool): Whether to plot tilt correction
-        timezone (str): Timezone for the data
-        plot_original_data (bool): Whether to plot original data
-        save_processed_data (bool): Whether to save processed data
-        remote_reference (str): Remote reference site name
-        apply_filtering (bool): Whether to apply filtering
-        filter_type (str): Type of filter to apply
-        filter_channels (list): Channels to filter
-        filter_params (dict): Filter parameters
-        plot_heatmaps (bool): Whether to generate heatmaps
-        heatmap_nperseg (int): Number of points per segment for heatmap FFT
-        heatmap_noverlap (int): Number of points to overlap between heatmap segments
-        heatmap_thresholds (dict): Custom coherence thresholds for heatmap quality scoring
-        site_config (dict): Site-specific configuration from Processing.txt
-        run_lemimt (bool): Whether to run lemimt.exe on the processed output file
-        lemimt_path (str): Full path to the lemimt.exe executable
+        site (str): Site folder name.
+        parent_dir (str): Parent directory containing site folders.
+        apply_drift_correction (bool): Whether to apply drift correction.
+        apply_rotation (bool): Whether to apply rotation.
+        tilt_correction (bool): Whether to apply tilt correction.
+        apply_smoothing (bool): Whether to apply smoothing.
+        smoothing_method (str): Smoothing method to use.
+        smoothing_window (int): Window size for smoothing.
+        threshold_factor (float): Threshold factor for outlier detection.
+        plot_timeseries (bool): Whether to plot data.
+        plot_boundaries (bool): Whether to plot boundaries.
+        plot_smoothed_windows (bool): Whether to plot smoothed windows.
+        plot_coherence (bool): Whether to plot coherence.
+        perform_freq_analysis (bool): Whether to perform frequency analysis.
+        log_first_rows (bool): Whether to log first rows.
+        sens_start (int): Start sample for sensitivity test.
+        sens_end (int): End sample for sensitivity test.
+        skip_minutes (list): Minutes to skip from start and end.
+        plot_drift (bool): Whether to plot drift correction.
+        plot_rotation (bool): Whether to plot rotation.
+        plot_tilt (bool): Whether to plot tilt correction.
+        timezone (str): Timezone for the data.
+        plot_original_data (bool): Whether to plot original data.
+        remote_reference (str, optional): Remote reference site name.
+        apply_filtering (bool): Whether to apply frequency filtering.
+        filter_type (str): Type of filter to apply.
+        filter_channels (list, optional): Channels to filter.
+        filter_params (dict, optional): Additional filter parameters.
+        plot_heatmaps (bool): Whether to generate heatmap plots.
+        heatmap_nperseg (int): Number of points per segment for heatmap FFT.
+        heatmap_noverlap (int, optional): Number of points to overlap between heatmap segments.
+        heatmap_thresholds (dict, optional): Custom coherence thresholds for heatmap quality scoring.
+        run_lemimt (bool): Whether to run lemimt.exe on the processed output file.
+        lemimt_path (str): Full path to the lemimt.exe executable.
     
     Returns:
-        dict: Processing results for the site
+        dict: Results dictionary.
     """
     try:
-        write_site_log(f"Starting processing for site: {site}")
+        site_dir = os.path.join(parent_dir, site)
+        if not os.path.exists(site_dir):
+            write_batch_log(f"Site directory not found: {site_dir}", level="ERROR")
+            return {"status": "FAILED", "error": f"Directory not found: {site_dir}"}
         
-        # Use site-specific remote reference if available in config
-        if site_config and 'remote_reference' in site_config:
-            site_remote_ref = site_config['remote_reference']
-            if site_remote_ref and site_remote_ref != 'None':
-                remote_reference = site_remote_ref
-                write_site_log(f"Using site-specific remote reference: {remote_reference}")
+        write_batch_log(f"Processing site: {site}")
         
-        # Create processor
+        # Create processor instance
         processor = ProcessASCII(
             input_dir=os.path.join(parent_dir, site),
             param_file="config/recorder.ini",
             average=False,
             perform_freq_analysis=perform_freq_analysis,
-            plot_data=plot_data,
+            plot_timeseries=plot_timeseries,
             apply_smoothing=apply_smoothing,
             smoothing_window=smoothing_window,
             threshold_factor=threshold_factor,
@@ -115,7 +106,7 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
             timezone=timezone,
             plot_original_data=plot_original_data,
             save_raw_data=False,
-            save_processed_data=save_processed_data,
+            save_processed_data=True,  # Always save processed data
             remote_reference=remote_reference,
             apply_filtering=apply_filtering,
             filter_type=filter_type,
@@ -131,80 +122,77 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
         processor.run_lemimt = run_lemimt
         processor.lemimt_path = lemimt_path
         
-        # Override metadata with site-specific config if available
-        if site_config:
-            if 'xarm' in site_config:
-                processor.metadata['xarm'] = site_config['xarm']
-            if 'yarm' in site_config:
-                processor.metadata['yarm'] = site_config['yarm']
-            write_site_log(f"Using site config: xarm={site_config.get('xarm', 'default')} m, yarm={site_config.get('yarm', 'default')} m")
+        # Always save plots when plotting
+        processor.save_plots = plot_timeseries
         
-        # Process the data
+        processor.tilt_correction = tilt_correction
+        
+        # Process the site
         processor.process_all_files()
         
-        write_site_log(f"Successfully completed processing for site: {site}")
-        return {'status': 'SUCCESS', 'site': site, 'end_time': datetime.datetime.now()}
+        return processor.results
         
     except Exception as e:
         error_msg = f"Error processing site {site}: {e}"
-        write_site_log(error_msg, level="ERROR")
-        return {'status': 'FAILED', 'site': site, 'error': str(e), 'end_time': datetime.datetime.now()}
+        write_batch_log(error_msg, level="ERROR")
+        return {"status": "FAILED", "error": str(e)}
+
 
 def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotation, tilt_correction,
                         apply_smoothing, smoothing_method, smoothing_window,
-                        threshold_factor, plot_data, plot_boundaries,
+                        threshold_factor, plot_timeseries, plot_boundaries,
                         plot_smoothed_windows, plot_coherence, perform_freq_analysis,
-                        log_first_rows, sens_start, sens_end, skip_minutes, save_plots,
+                        log_first_rows, sens_start, sens_end, skip_minutes,
                         max_workers, plot_drift, plot_rotation, plot_tilt, timezone, plot_original_data,
-                        save_processed_data, remote_reference=None, apply_filtering=False,
+                        remote_reference=None, apply_filtering=False,
                         filter_type="comb", filter_channels=None, filter_params=None,
                         plot_heatmaps=False, heatmap_nperseg=1024, heatmap_noverlap=None, heatmap_thresholds=None,
-                        site_configs=None, run_lemimt=False, lemimt_path="lemimt.exe"):
-    """Process multiple sites in parallel.
+                        run_lemimt=False, lemimt_path="lemimt.exe"):
+    """
+    Processes multiple MT sites in parallel.
     
     Args:
-        sites (list): List of site names to process
-        parent_dir (str): Parent directory containing site folders
-        apply_drift_correction (bool): Whether to apply drift correction
-        apply_rotation (bool): Whether to apply rotation correction
-        tilt_correction (bool): Whether to apply tilt correction
-        apply_smoothing (bool): Whether to apply smoothing
-        smoothing_method (str): Smoothing method to use
-        smoothing_window (int): Smoothing window size
-        threshold_factor (float): Threshold factor for smoothing
-        plot_data (bool): Whether to plot data
-        plot_boundaries (bool): Whether to plot file boundaries
-        plot_smoothed_windows (bool): Whether to plot smoothed windows
-        plot_coherence (bool): Whether to plot coherence
-        perform_freq_analysis (str): Frequency analysis options
-        log_first_rows (bool): Whether to log first rows
-        sens_start (int): Sensor start index
-        sens_end (int): Sensor end index
-        skip_minutes (list): Minutes to skip from start and end
-        save_plots (bool): Whether to save plots
-        max_workers (int): Maximum number of parallel workers
-        plot_drift (bool): Whether to plot drift correction
-        plot_rotation (bool): Whether to plot rotation correction
-        plot_tilt (bool): Whether to plot tilt correction
-        timezone (str): Timezone for the data
-        plot_original_data (bool): Whether to plot original data
-        save_processed_data (bool): Whether to save processed data
-        remote_reference (str): Remote reference site name
-        apply_filtering (bool): Whether to apply filtering
-        filter_type (str): Type of filter to apply
-        filter_channels (list): Channels to filter
-        filter_params (dict): Filter parameters
-        plot_heatmaps (bool): Whether to generate heatmaps
-        heatmap_nperseg (int): Number of points per segment for heatmap FFT
-        heatmap_noverlap (int): Number of points to overlap between heatmap segments
-        heatmap_thresholds (dict): Custom coherence thresholds for heatmap quality scoring
-        site_configs (dict): Dictionary mapping site names to their configurations
-        run_lemimt (bool): Whether to run lemimt.exe on the processed output file
-        lemimt_path (str): Full path to the lemimt.exe executable
+        sites (list): List of site folder names.
+        parent_dir (str): Parent directory containing site folders.
+        apply_drift_correction (bool): Whether to apply drift correction.
+        apply_rotation (bool): Whether to apply rotation.
+        tilt_correction (bool): Whether to apply tilt correction.
+        apply_smoothing (bool): Whether to apply smoothing.
+        smoothing_method (str): Smoothing method to use.
+        smoothing_window (int): Window size for smoothing.
+        threshold_factor (float): Threshold factor for outlier detection.
+        plot_timeseries (bool): Whether to plot data.
+        plot_boundaries (bool): Whether to plot boundaries.
+        plot_smoothed_windows (bool): Whether to plot smoothed windows.
+        plot_coherence (bool): Whether to plot coherence.
+        perform_freq_analysis (bool): Whether to perform frequency analysis.
+        log_first_rows (bool): Whether to log first rows.
+        sens_start (int): Start sample for sensitivity test.
+        sens_end (int): End sample for sensitivity test.
+        skip_minutes (list): Minutes to skip from start and end.
+        max_workers (int): Maximum number of parallel workers.
+        plot_drift (bool): Whether to plot drift correction.
+        plot_rotation (bool): Whether to plot rotation.
+        plot_tilt (bool): Whether to plot tilt correction.
+        timezone (str): Timezone for the data.
+        plot_original_data (bool): Whether to plot original data.
+        remote_reference (str, optional): Remote reference site name.
+        apply_filtering (bool): Whether to apply frequency filtering.
+        filter_type (str): Type of filter to apply.
+        filter_channels (list, optional): Channels to filter.
+        filter_params (dict, optional): Additional filter parameters.
+        plot_heatmaps (bool): Whether to generate heatmap plots.
+        heatmap_nperseg (int): Number of points per segment for heatmap FFT.
+        heatmap_noverlap (int, optional): Number of points to overlap between heatmap segments.
+        heatmap_thresholds (dict, optional): Custom coherence thresholds for heatmap quality scoring.
+        run_lemimt (bool): Whether to run lemimt.exe on the processed output file.
+        lemimt_path (str): Full path to the lemimt.exe executable.
     
     Returns:
-        dict: Dictionary mapping site names to results
+        dict: Dictionary mapping site names to results.
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    
     start_time = datetime.datetime.now()
     write_batch_log(f"Starting batch processing of {len(sites)} sites at {start_time}")
     
@@ -215,21 +203,18 @@ def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotatio
         # Submit all tasks
         future_to_site = {}
         for site in sites:
-            # Get site-specific config if available
-            site_config = site_configs.get(site, {}) if site_configs else {}
-            
             future = executor.submit(
                 process_single_site,
                 site, parent_dir, apply_drift_correction, apply_rotation, tilt_correction,
                 apply_smoothing, smoothing_method, smoothing_window,
-                threshold_factor, plot_data, plot_boundaries,
+                threshold_factor, plot_timeseries, plot_boundaries,
                 plot_smoothed_windows, plot_coherence, perform_freq_analysis,
-                log_first_rows, sens_start, sens_end, skip_minutes, save_plots,
+                log_first_rows, sens_start, sens_end, skip_minutes,
                 plot_drift, plot_rotation, plot_tilt, timezone, plot_original_data,
-                save_processed_data, remote_reference, apply_filtering,
+                remote_reference, apply_filtering,
                 filter_type, filter_channels, filter_params,
                 plot_heatmaps, heatmap_nperseg, heatmap_noverlap, heatmap_thresholds,
-                site_config, run_lemimt, lemimt_path
+                run_lemimt, lemimt_path
             )
             future_to_site[future] = site
         
@@ -239,341 +224,438 @@ def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotatio
             try:
                 result = future.result()
                 results[site] = result
-                if result['status'] == 'SUCCESS':
-                    write_batch_log(f"Site {site} completed successfully")
-                else:
-                    write_batch_log(f"Site {site} failed: {result.get('error', 'Unknown error')}", level="ERROR")
+                status = result.get('status', 'UNKNOWN')
+                write_batch_log(f"Completed {site}: {status}")
             except Exception as e:
-                error_msg = f"Exception occurred while processing site {site}: {e}"
+                error_msg = f"Exception occurred while processing {site}: {e}"
                 write_batch_log(error_msg, level="ERROR")
-                results[site] = {'status': 'FAILED', 'site': site, 'error': str(e), 'end_time': datetime.datetime.now()}
+                results[site] = {'status': 'FAILED', 'error': str(e)}
     
     # Create and display batch summary
-    summary = create_batch_summary(sites, results, start_time)
-    print(summary)
-    write_batch_log(summary)
+    create_batch_summary(sites, results, start_time)
     
     return results
 
-def main():
-    parser = argparse.ArgumentParser(description="Batch process multiple EDL sites")
-    
-    # Site selection - either use --sites or --config_file
-    site_group = parser.add_mutually_exclusive_group(required=True)
-    site_group.add_argument("--sites", nargs="+", help="List of site directories to process")
-    site_group.add_argument("--config_file", help="Path to Processing.txt or similar config file")
-    
-    parser.add_argument("--parent_dir", default=".", help="Parent directory containing site folders")
-    parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of parallel workers")
-    
-    # Processing options
-    parser.add_argument("--apply_drift_correction", action="store_true", help="Apply drift correction")
-    parser.add_argument("--apply_rotation", action="store_true", help="Apply rotation correction")
-    parser.add_argument("--tilt_correction", action="store_true", help="Apply tilt correction")
-    parser.add_argument("--apply_smoothing", action="store_true", help="Apply smoothing")
-    parser.add_argument("--smoothing_method", choices=["median", "adaptive"], default="median", help="Smoothing method")
-    parser.add_argument("--smoothing_window", type=int, default=2500, help="Smoothing window size")
-    parser.add_argument("--threshold_factor", type=float, default=10.0, help="Threshold factor for smoothing")
-    
-    # Plotting options
-    parser.add_argument("--plot_data", action="store_true", help="Plot data")
-    parser.add_argument("--plot_boundaries", action="store_true", help="Plot file boundaries")
-    parser.add_argument("--plot_smoothed_windows", action="store_true", help="Plot smoothed windows")
-    parser.add_argument("--plot_coherence", action="store_true", help="Plot coherence")
-    parser.add_argument("--plot_drift", action="store_true", help="Plot drift correction")
-    parser.add_argument("--plot_rotation", action="store_true", help="Plot rotation correction")
-    parser.add_argument("--plot_tilt", action="store_true", help="Plot tilt correction")
-    parser.add_argument("--plot_original_data", action="store_true", help="Plot original data")
-    parser.add_argument("--save_plots", action="store_true", help="Save plots")
-    
-    # Data options
-    parser.add_argument("--save_processed_data", action="store_true", help="Save processed data")
-    parser.add_argument("--log_first_rows", action="store_true", help="Log first rows of data")
-    parser.add_argument("--sens_start", type=int, default=0, help="Sensor start index")
-    parser.add_argument("--sens_end", type=int, default=5000, help="Sensor end index")
-    parser.add_argument("--skip_minutes", nargs=2, type=int, default=[0, 0], help="Minutes to skip from start and end")
-    parser.add_argument("--timezone", default="UTC", help="Timezone for the data")
-    
-    # Frequency analysis
-    parser.add_argument("--perform_freq_analysis", help="Frequency analysis options (W=Welch, M=Multi-taper, S=Spectrogram)")
-    
-    # Remote reference
-    parser.add_argument("--remote_reference", help="Remote reference site name (overrides config file)")
-    
-    # Filtering options
-    parser.add_argument("--apply_filtering", action="store_true", help="Apply frequency filtering")
-    parser.add_argument("--filter_type", choices=["comb", "bandpass", "highpass", "lowpass", "adaptive"], default="comb", help="Filter type")
-    parser.add_argument("--filter_channels", nargs="+", help="Channels to filter")
-    parser.add_argument("--filter_notch_freq", type=float, default=50.0, help="Notch frequency for comb filter")
-    parser.add_argument("--filter_quality_factor", type=float, default=30.0, help="Quality factor for comb filter")
-    parser.add_argument("--filter_harmonics", nargs="+", type=float, help="Harmonic frequencies for comb filter")
-    parser.add_argument("--filter_low_freq", type=float, default=0.1, help="Low frequency for bandpass filter")
-    parser.add_argument("--filter_high_freq", type=float, default=10.0, help="High frequency for bandpass filter")
-    parser.add_argument("--filter_cutoff_freq", type=float, default=0.1, help="Cutoff frequency for highpass/lowpass filter")
-    parser.add_argument("--filter_order", type=int, default=4, help="Filter order")
-    parser.add_argument("--filter_reference_channel", help="Reference channel for adaptive filtering")
-    parser.add_argument("--filter_length", type=int, default=64, help="Filter length for adaptive filtering")
-    parser.add_argument("--filter_mu", type=float, default=0.01, help="Step size for adaptive filtering")
-    parser.add_argument("--filter_method", choices=["filtfilt", "lfilter"], default="filtfilt", help="Filtering method")
-    
-    # Heatmap options
-    parser.add_argument("--plot_heatmaps", action="store_true", help="Generate heatmap plots for quality control")
-    parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="Number of points per segment for heatmap FFT")
-    parser.add_argument("--heatmap_noverlap", type=int, help="Number of points to overlap between heatmap segments")
-    parser.add_argument("--heatmap_thresholds", help="Custom coherence thresholds for heatmap quality scoring")
-    
-    # LEMIMT.EXE integration
-    parser.add_argument("--run_lemimt", action="store_true", default=False,
-                        help="Run lemimt.exe on the processed output file after processing is complete")
-    parser.add_argument("--lemimt_path", type=str, default="lemimt.exe",
-                        help="Full path to the lemimt.exe executable (default: lemimt.exe in current directory)")
-    
-    # Logging
-    parser.add_argument("--log_level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO", help="Log level")
+
+def process_single_task(task, args, worker_num=None):
+    """Process a single task with the given arguments."""
+    try:
+        # Call EDL_Process.py for each task
+        # Set environment variable for worker number
+        env = os.environ.copy()
+        env['WORKER_NUM'] = str(worker_num) if worker_num else '1'
+        
+        # Build command for EDL_Process.py
+        cmd = [sys.executable, "EDL_Process.py", "--site_name", task['site_name']]
+        
+        # Add all the processing arguments
+        if args.apply_drift_correction:
+            cmd.append("--apply_drift_correction")
+        if args.apply_rotation:
+            cmd.append("--apply_rotation")
+        if args.tilt_correction:
+            cmd.append("--tilt_correction")
+        if args.apply_smoothing:
+            cmd.extend(["--apply_smoothing", "--smoothing_method", args.smoothing_method,
+                       "--smoothing_window", str(args.smoothing_window),
+                       "--threshold_factor", str(args.threshold_factor)])
+        if args.plot_timeseries:
+            cmd.append("--plot_timeseries")
+        if args.plot_boundaries:
+            cmd.append("--plot_boundaries")
+        if args.plot_smoothed_windows:
+            cmd.append("--plot_smoothed_windows")
+        if args.plot_coherence:
+            cmd.append("--plot_coherence")
+        if args.perform_freq_analysis:
+            cmd.extend(["--perform_freq_analysis", args.perform_freq_analysis])
+        if args.log_first_rows:
+            cmd.append("--log_first_rows")
+        if args.sens_start != 0 or args.sens_end != 5000:
+            cmd.extend(["--sens_start", str(args.sens_start), "--sens_end", str(args.sens_end)])
+        if args.skip_minutes != [0, 0]:
+            cmd.extend(["--skip_minutes"] + [str(x) for x in args.skip_minutes])
+        if args.plot_drift:
+            cmd.append("--plot_drift")
+        if args.plot_rotation:
+            cmd.append("--plot_rotation")
+        if args.plot_tilt:
+            cmd.append("--plot_tilt")
+        if args.timezone != ["UTC"]:
+            cmd.extend(["--timezone"] + args.timezone)
+        if args.plot_original_data:
+            cmd.append("--plot_original_data")
+        
+        # IMPORTANT: Use remote reference from Processing.txt, not command line
+        if task['remote_reference']:
+            cmd.extend(["--remote_reference", task['remote_reference']])
+        elif args.remote_reference:
+            # Only use command line remote reference if not specified in Processing.txt
+            cmd.extend(["--remote_reference", args.remote_reference])
+        
+        if args.apply_filtering:
+            cmd.extend(["--apply_filtering", "--filter_type", args.filter_type])
+            if args.filter_channels:
+                cmd.extend(["--filter_channels"] + args.filter_channels)
+            if args.filter_notch_freq != 50.0:
+                cmd.extend(["--filter_notch_freq", str(args.filter_notch_freq)])
+            if args.filter_quality_factor != 30.0:
+                cmd.extend(["--filter_quality_factor", str(args.filter_quality_factor)])
+            if args.filter_harmonics:
+                cmd.extend(["--filter_harmonics"] + [str(x) for x in args.filter_harmonics])
+            if args.filter_low_freq:
+                cmd.extend(["--filter_low_freq", str(args.filter_low_freq)])
+            if args.filter_high_freq:
+                cmd.extend(["--filter_high_freq", str(args.filter_high_freq)])
+            if args.filter_cutoff_freq:
+                cmd.extend(["--filter_cutoff_freq", str(args.filter_cutoff_freq)])
+            if args.filter_order != 4:
+                cmd.extend(["--filter_order", str(args.filter_order)])
+            if args.filter_reference_channel:
+                cmd.extend(["--filter_reference_channel", args.filter_reference_channel])
+            if args.filter_length != 64:
+                cmd.extend(["--filter_length", str(args.filter_length)])
+            if args.filter_mu != 0.01:
+                cmd.extend(["--filter_mu", str(args.filter_mu)])
+            if args.filter_method != "filtfilt":
+                cmd.extend(["--filter_method", args.filter_method])
+        if args.plot_heatmaps:
+            cmd.append("--plot_heatmaps")
+            if args.heatmap_nperseg != 1024:
+                cmd.extend(["--heatmap_nperseg", str(args.heatmap_nperseg)])
+            if args.heatmap_noverlap:
+                cmd.extend(["--heatmap_noverlap", str(args.heatmap_noverlap)])
+            if args.heatmap_thresholds:
+                cmd.extend(["--heatmap_thresholds", args.heatmap_thresholds])
+        if args.decimate:
+            cmd.extend(["--decimate"] + [str(x) for x in args.decimate])
+        if args.run_lemimt:
+            cmd.extend(["--run_lemimt", "--lemimt_path", args.lemimt_path])
+        
+        # Run the command with environment variable
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        
+        if result.returncode == 0:
+            return {
+                'site': task['site_name'],
+                'remote_reference': task['remote_reference'],
+                'status': 'success',
+                'output': result.stdout
+            }
+        else:
+            return {
+                'site': task['site_name'],
+                'remote_reference': task['remote_reference'],
+                'status': 'failed',
+                'error': result.stderr
+            }
+            
+    except Exception as e:
+        return {
+            'site': task['site_name'],
+            'remote_reference': task['remote_reference'],
+            'status': 'exception',
+            'error': str(e)
+        }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Batch process multiple MT sites using Processing.txt configuration.")
+    parser.add_argument("--input_config", action="store_true", help="Use Processing.txt configuration file for site parameters and remote references.")
+    parser.add_argument("--parent_dir", default=".", help="Parent directory containing site folders.")
+    parser.add_argument("--apply_drift_correction", action="store_true", help="Apply drift correction to the data.")
+    parser.add_argument("--apply_rotation", action="store_true", help="Apply rotation correction based on the 'erotate' parameter.")
+    parser.add_argument("--tilt_correction", action="store_true", help="Apply tilt correction to make mean(By) = 0.")
+    parser.add_argument("--apply_smoothing", action="store_true", help="Apply smoothing to the data.")
+    parser.add_argument("--smoothing_method", choices=["median", "adaptive"], default="median", help="Smoothing method to use.")
+    parser.add_argument("--smoothing_window", type=int, default=2500, help="Window size for smoothing.")
+    parser.add_argument("--threshold_factor", type=float, default=10.0, help="Threshold multiplier for outlier detection.")
+    parser.add_argument("--plot_timeseries", action="store_true", help="Display physical channel plots.")
+    parser.add_argument("--plot_boundaries", action="store_true", help="Plot file boundaries.")
+    parser.add_argument("--plot_smoothed_windows", action="store_true", help="Shade smoothed windows.")
+    parser.add_argument("--plot_coherence", action="store_true", help="Plot power spectra and coherence.")
+    parser.add_argument("--perform_freq_analysis", nargs="?", const="W", metavar="METHODS",
+                        help="Perform frequency analysis. Use W for Welch, M for Multi-taper, S for Spectrogram. "
+                             "Combine them: 'WMS' for all three, 'WM' for Welch + Multi-taper, etc. Default: W")
+    parser.add_argument("--log_first_rows", action="store_true", help="Log the first 5 rows from each file.")
+    parser.add_argument("--sens_start", type=int, default=0, help="Start sensor index for processing.")
+    parser.add_argument("--sens_end", type=int, default=5000, help="End sensor index for processing.")
+    parser.add_argument("--skip_minutes", nargs=2, type=int, default=[0, 0], 
+                        help="Skip first and last N minutes of data (e.g., --skip_minutes 10 20).")
+    parser.add_argument("--plot_drift", action="store_true", help="Plot drift-corrected data in timeseries.")
+    parser.add_argument("--plot_rotation", action="store_true", help="Plot rotated data in timeseries.")
+    parser.add_argument("--plot_tilt", action="store_true", help="Plot tilt-corrected data in timeseries.")
+    parser.add_argument("--timezone", nargs="+", default=["UTC"], 
+                        help="Timezone(s) for the data. Use one timezone for both sites (e.g., 'Australia/Adelaide') or two timezones for main and remote sites (e.g., 'Australia/Adelaide' 'UTC')")
+    parser.add_argument("--plot_original_data", action="store_true", help="Plot original data alongside corrected data.")
+    parser.add_argument("--remote_reference", help="Remote reference site name for processing (overrides Processing.txt if specified).")
+    parser.add_argument("--apply_filtering", action="store_true", help="Apply frequency filtering to the data.")
+    parser.add_argument("--filter_type", choices=["comb", "bandpass", "highpass", "lowpass", "adaptive"], 
+                        default="comb", help="Type of filter to apply.")
+    parser.add_argument("--filter_channels", nargs="+", help="Specific channels to filter (default: all channels).")
+    parser.add_argument("--filter_notch_freq", type=float, default=50.0, help="Notch frequency for comb filter (Hz).")
+    parser.add_argument("--filter_quality_factor", type=float, default=30.0, help="Quality factor for comb filter.")
+    parser.add_argument("--filter_harmonics", nargs="+", type=float, help="Specific harmonics to notch (default: auto-detect).")
+    parser.add_argument("--filter_low_freq", type=float, help="Low frequency cutoff for bandpass filter (Hz).")
+    parser.add_argument("--filter_high_freq", type=float, help="High frequency cutoff for bandpass filter (Hz).")
+    parser.add_argument("--filter_cutoff_freq", type=float, help="Cutoff frequency for highpass/lowpass filter (Hz).")
+    parser.add_argument("--filter_order", type=int, default=4, help="Filter order (higher = sharper cutoff).")
+    parser.add_argument("--filter_reference_channel", help="Reference channel for adaptive filtering.")
+    parser.add_argument("--filter_length", type=int, default=64, help="Filter length for adaptive filtering.")
+    parser.add_argument("--filter_mu", type=float, default=0.01, help="Step size for adaptive filtering.")
+    parser.add_argument("--filter_method", choices=["filtfilt", "lfilter"], default="filtfilt", 
+                        help="Filtering method (filtfilt=zero-phase, lfilter=causal).")
+    parser.add_argument("--plot_heatmaps", action="store_true", help="Generate coherence heatmaps for quality control.")
+    parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="FFT segment length for heatmaps.")
+    parser.add_argument("--heatmap_noverlap", type=int, help="Overlap between FFT segments for heatmaps.")
+    parser.add_argument("--heatmap_thresholds", help="Comma-separated coherence thresholds for heatmaps (e.g., '0.9,0.7,0.7').")
+    parser.add_argument("--decimate", nargs="+", type=int, help="Decimation factors to apply (e.g., --decimate 2 5 10).")
+    parser.add_argument("--run_lemimt", action="store_true", help="Run lemimt processing after data processing.")
+    parser.add_argument("--lemimt_path", default="lemimt.exe", help="Path to lemimt executable.")
+    parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of parallel workers.")
     
     args = parser.parse_args()
     
+    # Validate arguments
+    if not args.input_config:
+        parser.error("--input_config is required. This script processes all sites from Processing.txt configuration file.")
+    
     # Set up logging
-    set_log_level(args.log_level)
+    from EDL_Process import set_log_level, set_batch_mode, write_batch_log
+    set_log_level("INFO")
     set_batch_mode(True)
     
-    # Determine sites to process
-    sites = []
-    site_configs = {}
+    write_batch_log("Starting batch processing with Processing.txt configuration")
     
-    if args.config_file:
-        # Read sites from config file
-        write_batch_log(f"Reading site configuration from: {args.config_file}")
-        site_configs = read_processing_config(args.config_file)
+    # Load sites from Processing.txt
+    from EDL_Process import read_processing_config
+    processing_config = read_processing_config()
+    write_batch_log(f"Loaded Processing.txt configuration with {len(processing_config)} sites")
+    
+    # Create processing tasks for each site and its remote references
+    processing_tasks = []
+    for site_name, site_config in processing_config.items():
+        # Handle multiple remote references
+        remote_refs = []
+        if site_config.get('remote_reference'):
+            remote_ref_str = site_config['remote_reference']
+            if remote_ref_str.startswith('[') and remote_ref_str.endswith(']'):
+                # Multiple remote references
+                remote_refs = [ref.strip() for ref in remote_ref_str[1:-1].split(';')]
+            else:
+                # Single remote reference
+                remote_refs = [remote_ref_str.strip()]
         
-        if not site_configs:
-            write_batch_log(f"No valid site configurations found in {args.config_file}", level="ERROR")
-            return
+        # If no remote references in config, use command line argument
+        if not remote_refs and args.remote_reference:
+            remote_refs = [args.remote_reference]
         
-        sites = list(site_configs.keys())
+        # Process with each remote reference (or no remote reference)
+        for remote_ref in remote_refs + [None] if remote_refs else [None]:
+            processing_tasks.append({
+                'site_name': site_name,
+                'xarm': site_config['xarm'],
+                'yarm': site_config['yarm'],
+                'remote_reference': remote_ref
+            })
+    
+    write_batch_log(f"Created {len(processing_tasks)} processing tasks from Processing.txt")
+    
+    # Process each task with parallel processing
+    results = []
+    
+    # Use ThreadPoolExecutor for parallel processing
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        # Submit all tasks with worker numbers
+        future_to_task = {}
+        for i, task in enumerate(processing_tasks):
+            # Assign worker number (1-based)
+            worker_num = (i % args.max_workers) + 1
+            future = executor.submit(
+                process_single_task,
+                task, args, worker_num
+            )
+            future_to_task[future] = task
         
-        # Check if only one site is specified
-        if len(sites) == 1:
-            site = sites[0]
-            write_batch_log(f"Only one site found in config file: {site}")
-            write_batch_log(f"Consider using single-site processing instead:")
-            write_batch_log(f"  python EDL_Process.py --input_dir {site} [other options]")
-            write_batch_log(f"Continuing with batch processing for single site...")
-        
-        write_batch_log(f"Found {len(sites)} sites in config file: {', '.join(sites)}")
-        
-        # Display site configurations
-        for site, config in site_configs.items():
-            write_batch_log(f"Site {site}: xarm={config.get('xarm', 'N/A')} m, yarm={config.get('yarm', 'N/A')} m, remote_ref={config.get('remote_reference', 'None')}")
+        # Collect results as they complete
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                result = future.result()
+                results.append(result)
+                status = result.get('status', 'UNKNOWN')
+                write_batch_log(f"✓ Completed {task['site_name']}" + 
+                              (f" with remote reference {task['remote_reference']}" if task['remote_reference'] else "") +
+                              f": {status}")
+            except Exception as e:
+                write_batch_log(f"✗ Exception processing {task['site_name']}: {str(e)}", level="ERROR")
+                results.append({
+                    'site': task['site_name'],
+                    'remote_reference': task['remote_reference'],
+                    'status': 'exception',
+                    'error': str(e)
+                })
     
-    else:
-        # Use manually specified sites
-        sites = args.sites
-        write_batch_log(f"Processing {len(sites)} manually specified sites: {', '.join(sites)}")
-    
-    # Prepare filter parameters
-    filter_params = {
-        'notch_freq': args.filter_notch_freq,
-        'quality_factor': args.filter_quality_factor,
-        'harmonics': args.filter_harmonics,
-        'low_freq': args.filter_low_freq,
-        'high_freq': args.filter_high_freq,
-        'cutoff_freq': args.filter_cutoff_freq,
-        'order': args.filter_order,
-        'reference_channel': args.filter_reference_channel,
-        'filter_length': args.filter_length,
-        'mu': args.filter_mu,
-        'method': args.filter_method
-    }
-    
-    # Parse heatmap thresholds if provided
-    heatmap_thresholds = args.heatmap_thresholds
-    if isinstance(heatmap_thresholds, str):
-        try:
-            parts = heatmap_thresholds.split(',')
-            if len(parts) == 3:
-                heatmap_thresholds = {
-                    'good': float(parts[0]),
-                    'fair': float(parts[1]),
-                    'poor': float(parts[2])
-                }
-        except Exception as e:
-            write_batch_log(f"Error parsing heatmap thresholds: {e}, using defaults", level="WARNING")
-            heatmap_thresholds = None
-    
-    # Process the sites
-    results = batch_process_sites(
-        sites=sites,
-        parent_dir=args.parent_dir,
-        apply_drift_correction=args.apply_drift_correction,
-        apply_rotation=args.apply_rotation,
-        tilt_correction=args.tilt_correction,
-        apply_smoothing=args.apply_smoothing,
-        smoothing_method=args.smoothing_method,
-        smoothing_window=args.smoothing_window,
-        threshold_factor=args.threshold_factor,
-        plot_data=args.plot_data,
-        plot_boundaries=args.plot_boundaries,
-        plot_smoothed_windows=args.plot_smoothed_windows,
-        plot_coherence=args.plot_coherence,
-        perform_freq_analysis=args.perform_freq_analysis,
-        log_first_rows=args.log_first_rows,
-        sens_start=args.sens_start,
-        sens_end=args.sens_end,
-        skip_minutes=args.skip_minutes,
-        save_plots=args.save_plots,
-        max_workers=args.max_workers,
-        plot_drift=args.plot_drift,
-        plot_rotation=args.plot_rotation,
-        plot_tilt=args.plot_tilt,
-        timezone=args.timezone,
-        plot_original_data=args.plot_original_data,
-        save_processed_data=args.save_processed_data,
-        remote_reference=args.remote_reference,
-        apply_filtering=args.apply_filtering,
-        filter_type=args.filter_type,
-        filter_channels=args.filter_channels,
-        filter_params=filter_params,
-        plot_heatmaps=args.plot_heatmaps,
-        heatmap_nperseg=args.heatmap_nperseg,
-        heatmap_noverlap=args.heatmap_noverlap,
-        heatmap_thresholds=heatmap_thresholds,
-        site_configs=site_configs,
-        run_lemimt=args.run_lemimt,
-        lemimt_path=args.lemimt_path
-    )
-    
-    # Print final summary
-    successful = sum(1 for r in results.values() if r['status'] == 'SUCCESS')
+    # Create summary
+    successful = sum(1 for r in results if r['status'] == 'success')
     failed = len(results) - successful
-    write_batch_log(f"Batch processing completed. Successful: {successful}, Failed: {failed}")
-
-if __name__ == "__main__":
-    main()
+    
+    write_batch_log(f"Batch processing completed: {successful} successful, {failed} failed")
+    
+    # Print summary
+    print(f"\n{'='*80}")
+    print(f"BATCH PROCESSING SUMMARY")
+    print(f"{'='*80}")
+    print(f"Total tasks: {len(results)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"Parallel workers used: {args.max_workers}")
+    print(f"{'='*80}")
+    
+    if failed > 0:
+        print(f"\nFAILED TASKS:")
+        for result in results:
+            if result['status'] != 'success':
+                print(f"  - {result['site']}" + 
+                      (f" (RR: {result['remote_reference']})" if result['remote_reference'] else "") +
+                      f": {result['error']}")
+    
+    write_batch_log("Batch processing finished")
 
 """
 To run: 
 
-# CONFIGURATION FILE EXAMPLES
-# ===========================
-
-# Using Processing.txt for batch processing (recommended):
-python EDL_Batch.py --config_file Processing.txt --parent_dir . --apply_rotation --tilt_correction --plot_data --save_plots
-
-# Using Processing.txt with all corrections:
-python EDL_Batch.py --config_file Processing.txt --parent_dir . --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots
-
-# Using custom config file:
-python EDL_Batch.py --config_file my_sites.txt --parent_dir . --plot_data --save_plots
-
-# MANUAL SITE SPECIFICATION EXAMPLES
-# ==================================
+# BASIC BATCH PROCESSING EXAMPLES
+# ===============================
 
 # Basic processing with rotation and tilt correction:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots --plot_data --plot_boundaries
+python EDL_Batch.py --input_config --apply_rotation --tilt_correction --apply_smoothing --plot_boundaries --plot_smoothed_windows --plot_timeseries
 
 # Processing with drift correction and rotation:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --skip_minutes 20 --plot_data --plot_boundaries --plot_smoothed_windows --smoothing_method median --save_plots
+python EDL_Batch.py --input_config --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --skip_minutes 20 --plot_timeseries --plot_boundaries --plot_smoothed_windows --smoothing_method median
 
 # Processing with drift correction and rotation, plotting both uncorrected and corrected data:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --plot_data --save_plots
+python EDL_Batch.py --input_config --apply_drift_correction --apply_rotation --plot_drift --plot_rotation --plot_timeseries
 
 # Processing with tilt correction, plotting both uncorrected and tilt-corrected data:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --max_workers 4 --tilt_correction --plot_tilt --plot_data --save_plots
+python EDL_Batch.py --input_config --tilt_correction --plot_tilt --plot_timeseries
 
 # Basic processing without any corrections:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots
+python EDL_Batch.py --input_config --plot_timeseries
 
 # Processing with timezone conversion (e.g., to local time):
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "Australia/Sydney" --plot_data --save_plots
+python EDL_Batch.py --input_config --timezone "Australia/Sydney" --plot_timeseries
 
 # Processing with timezone conversion and all corrections:
-python EDL_Batch.py --parent_dir . --sites HDD5449 HDD5456 HDD5470 HDD5974 --timezone "America/New_York" --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_data --save_plots
+python EDL_Batch.py --input_config --timezone "America/New_York" --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_timeseries
+
+# ADVANCED BATCH PROCESSING EXAMPLES
+# ==================================
+
+# Full processing pipeline with all corrections, smoothing, and analysis:
+python EDL_Batch.py --input_config --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --apply_smoothing --smoothing_method adaptive --perform_freq_analysis WMS --plot_coherence --plot_drift --plot_rotation --plot_tilt --plot_original_data --timezone "Australia/Sydney" --skip_minutes 5
+
+# Processing with custom smoothing parameters:
+python EDL_Batch.py --input_config --plot_timeseries --apply_smoothing --smoothing_window 500 --threshold_factor 3.0 --smoothing_method median --plot_boundaries --plot_smoothed_windows
+
+# Processing with all corrections but no smoothing:
+python EDL_Batch.py --input_config --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --plot_drift --plot_rotation --plot_tilt --plot_original_data
 
 # FREQUENCY FILTERING EXAMPLES
 # ============================
 
 # Basic comb filter for powerline noise removal (50 Hz and harmonics):
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --plot_timeseries
 
 # Comb filter with custom notch frequency (60 Hz for US powerline):
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --filter_notch_freq 60.0 --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --filter_notch_freq 60.0 --plot_timeseries
 
 # Bandpass filter for specific frequency range:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --plot_timeseries
 
 # Highpass filter to remove DC and low-frequency drift:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type highpass --filter_cutoff_freq 0.001 --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type highpass --filter_cutoff_freq 0.001 --plot_timeseries
 
 # Lowpass filter to remove high-frequency noise:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type lowpass --filter_cutoff_freq 5.0 --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type lowpass --filter_cutoff_freq 5.0 --plot_timeseries
 
 # Filter specific channels only:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --filter_channels Bx By --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --filter_channels Bx By --plot_timeseries
 
-# Adaptive filtering using remote reference:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type adaptive --filter_reference_channel rBx --plot_data --save_plots --save_processed_data
+# Adaptive filtering using remote reference (requires remote reference in Processing.txt):
+python EDL_Batch.py --input_config --apply_filtering --filter_type adaptive --filter_reference_channel rBx --plot_timeseries
 
 # Filtering with other corrections:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_timeseries
 
 # Filtering with smoothing:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --apply_smoothing --smoothing_method median --plot_data --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --apply_smoothing --smoothing_method median --plot_timeseries
 
 # HEATMAP EXAMPLES
 # =================
 
 # Basic heatmap generation for quality control:
-python EDL_Batch.py --config_file Processing.txt --plot_heatmaps --save_plots --save_processed_data
+python EDL_Batch.py --input_config --plot_heatmaps
 
 # Heatmap with custom FFT parameters:
-python EDL_Batch.py --config_file Processing.txt --plot_heatmaps --heatmap_nperseg 2048 --heatmap_noverlap 1024 --save_plots --save_processed_data
+python EDL_Batch.py --input_config --plot_heatmaps --heatmap_nperseg 2048 --heatmap_noverlap 1024
 
 # Heatmap with custom coherence thresholds:
-python EDL_Batch.py --config_file Processing.txt --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.7" --save_plots --save_processed_data
+python EDL_Batch.py --input_config --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.7"
 
 # Heatmap with remote reference (from Processing.txt):
-python EDL_Batch.py --config_file Processing.txt --plot_heatmaps --save_plots --save_processed_data
+python EDL_Batch.py --input_config --plot_heatmaps
 
 # Heatmap with filtering and corrections:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_heatmaps --save_plots --save_processed_data
+python EDL_Batch.py --input_config --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_heatmaps
 
 # Heatmap with frequency analysis:
-python EDL_Batch.py --config_file Processing.txt --plot_heatmaps --perform_freq_analysis WMS --plot_coherence --save_plots --save_processed_data
+python EDL_Batch.py --input_config --plot_heatmaps --perform_freq_analysis WMS --plot_coherence
 
-# FREQUENCY ANALYSIS EXAMPLES
-# ===========================
+# DECIMATION EXAMPLES
+# ===================
 
-# Welch power spectra analysis:
-python EDL_Batch.py --config_file Processing.txt --perform_freq_analysis W --plot_data --save_plots --save_processed_data
+# Process with 2x decimation (5 Hz output):
+python EDL_Batch.py --input_config --plot_timeseries --decimate 2
 
-# Multi-taper spectral analysis:
-python EDL_Batch.py --config_file Processing.txt --perform_freq_analysis M --plot_data --save_plots --save_processed_data
+# Process with multiple decimation factors (10 Hz, 5 Hz, 2 Hz, 1 Hz):
+python EDL_Batch.py --input_config --plot_timeseries --decimate 2 5 10
 
-# Spectrogram analysis:
-python EDL_Batch.py --config_file Processing.txt --perform_freq_analysis S --plot_data --save_plots --save_processed_data
+# Decimation with corrections:
+python EDL_Batch.py --input_config --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --decimate 2 5
 
-# All frequency analysis methods:
-python EDL_Batch.py --config_file Processing.txt --perform_freq_analysis WMS --plot_data --save_plots --save_processed_data
+# LEMIMT PROCESSING EXAMPLES
+# ==========================
 
-# LEMIMT.EXE INTEGRATION EXAMPLES
-# ===============================
+# Basic lemimt processing (requires Windows):
+python EDL_Batch.py --input_config --run_lemimt
 
-# Process and run lemimt.exe (Windows only):
-python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --run_lemimt
+# lemimt processing with custom executable path:
+python EDL_Batch.py --input_config --run_lemimt --lemimt_path "C:/Program Files/lemimt/lemimt.exe"
 
-# Process with lemimt and cleanup:
-python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --run_lemimt --cleanup_processed_files
+# lemimt processing with full processing pipeline:
+python EDL_Batch.py --input_config --plot_timeseries --apply_drift_correction --apply_rotation --tilt_correction --run_lemimt
 
-# COMPREHENSIVE WORKFLOW EXAMPLES
-# ===============================
+# lemimt processing with decimation:
+python EDL_Batch.py --input_config --run_lemimt --decimate 2 5
 
-# Complete processing pipeline with all features:
-python EDL_Batch.py --config_file Processing.txt --apply_drift_correction --apply_rotation --tilt_correction --apply_filtering --filter_type comb --apply_smoothing --smoothing_method median --perform_freq_analysis WMS --plot_heatmaps --plot_data --save_plots --save_processed_data --run_lemimt
+# PARALLEL PROCESSING EXAMPLES
+# ============================
 
-# Quality control focused processing:
-python EDL_Batch.py --config_file Processing.txt --apply_filtering --filter_type comb --plot_heatmaps --perform_freq_analysis WMS --plot_data --save_plots --save_processed_data
+# Process with custom number of parallel workers:
+python EDL_Batch.py --input_config --plot_timeseries --max_workers 8
 
-# Production processing with timezone and all corrections:
-python EDL_Batch.py --config_file Processing.txt --timezone "Australia/Sydney" --apply_drift_correction --apply_rotation --tilt_correction --apply_filtering --filter_type comb --plot_data --save_plots --save_processed_data --run_lemimt
+# Process with single worker (sequential processing):
+python EDL_Batch.py --input_config --plot_timeseries --max_workers 1
+
+# NOTES ON PROCESSING.TXT CONFIGURATION:
+# - The file should be in the format: Site, xarm, yarm, [remote_ref1; remote_ref2]
+# - Multiple remote references in brackets will create multiple processing runs
+# - Dipole lengths (xarm, yarm) are automatically applied from the configuration
+# - Remote references are automatically loaded and processed
+# - Each remote reference creates a separate output file with unique CPU prefix
+# - All sites in Processing.txt will be processed automatically
+# - Use --remote_reference to override Processing.txt remote references for all sites
 """
