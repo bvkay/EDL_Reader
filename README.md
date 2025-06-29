@@ -1,6 +1,6 @@
 # EDL Magnetotelluric (MT) Data Processing Suite
 
-A Python-based workflow for reading, processing, and analyzing magnetotelluric (MT) time series data from ASCII files, with support for batch processing, frequency analysis, corrections, and integration with LEMI MT executable tools.
+A Python-based workflow for reading, processing, and analyzing MT time series data from Earth Data Logger (EDL) ASCII files, with support for batch processing, frequency analysis, corrections, and integration with LEMI MT executable tools.
 
 ---
 
