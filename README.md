@@ -16,6 +16,7 @@ A Python-based workflow for reading, processing, and analyzing magnetotelluric (
 - Batch processing across multiple sites
 - Integration with LEMI MT executable (`lemimt.exe`)
 - Flexible timezone handling
+- Parallel processing of multiple sites with clear logging and summary tables.
 - Comprehensive logging and output management
 
 ---
@@ -35,8 +36,8 @@ The project expects the following directory and file organization:
 │       ├── [SiteName]_10Hz_output_processed.txt
 │       ├── [SiteName]_coherence.png
 │       └── ...
-├── HDD5449/
-│   ├── 294/
+├── [SiteName]/
+│   ├── [DayFolder]/
 │   │   ├── EDL_041020000000.gps
 │   │   ├── EDL_041020000000.gst
 │   │   ├── EDL_041020000000.pll
@@ -46,7 +47,7 @@ The project expects the following directory and file organization:
 │   │   ├── EDL_041020000000.EX
 │   │   ├── EDL_041020000000.EY
 │   │   └── ...
-│   ├── 295/
+│   ├── [DayFolder]/
 │   │   ├── EDL_041021000000.ambientTemperature
 │   │   ├── EDL_041021000000.BX
 │   │   └── ...
@@ -64,7 +65,6 @@ The project expects the following directory and file organization:
 - **HDDxxxx/**: Site folders, each with subfolders for each day (e.g., 294, 295), containing ASCII data files.
 - **outputs/**: All processed data and plots are saved here, organized by site.
 - **sensors/**: Instrument response files.
-- **Working_Backup/**: Backup copies of main scripts.
 
 ---
 ## Installation
@@ -83,6 +83,42 @@ pip install numpy pandas matplotlib scipy configparser pytz
 git clone https://github.com/yourusername/EDL_MT_Processing.git
 cd EDL_MT_Processing
 ```
+
+## Configuration File Format
+
+The `Processing.txt` file can be used to specify sites and their parameters for batch processing. It supports both 3-column and 4-column formats:
+
+### 4-Column Format (with remote reference)
+```csv
+Site, xarm, yarm, RemoteReference
+SiteA-50m, 45, 50, SiteD-50m
+SiteB-10m, 10, 9.8, SiteD-50m
+SiteC-10m, 10, 9.8, SiteD-50m
+SiteD-50m, 50, 49.5, SiteA-50m
+SiteA-50m, 45, 50, SiteB-10m
+SiteB-10m, 10, 9.8, 
+SiteC-10m, 10, 9.8, 
+SiteD-50m, 50, 49.5
+```
+**Column Definitions:**
+- **Site**: Site directory name
+- **xarm**: X dipole length in meters
+- **yarm**: Y dipole length in meters
+- **RemoteReference**: (Optional) Remote reference site name
+
+## Batch Processing with --config_file
+
+Both `EDL_Batch.py` and `Test_Batch.py` now support a `--config_file` argument:
+
+```bash
+python EDL_Batch.py --config_file Processing.txt --parent_dir . --plot_data --save_plots
+```
+
+- If only one site is listed in the config file, it will process that site (with a message suggesting single-site mode).
+- If multiple sites are listed, all will be processed in batch mode.
+- The `--sites` argument is still supported for manual site listing.
+
+See the updated script help (`-h`) for more details.
 
 ## Usage
 
@@ -114,13 +150,28 @@ python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_proces
 
 ### Batch Processing
 
-Process multiple sites in parallel:
+#### Method 1: Manual Site Listing
+Process multiple sites in parallel by listing them manually:
 ```bash
 python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
 ```
 
+#### Method 2: Configuration File (Recommended)
+Use `Processing.txt` to specify sites and their parameters:
+```bash
+python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
+```
+
+**Benefits of using `--config_file`:**
+- Site-specific dipole lengths (xarm, yarm) are automatically applied
+- Site-specific remote reference assignments are used
+- No need to manually list all sites
+- Easy to modify processing parameters for different sites
+- Supports different remote reference configurations per site
+
 #### Batch Options
-- `--sites [SITES ...]`       List of site directories to process
+- `--sites [SITES ...]`       List of site directories to process (mutually exclusive with --config_file)
+- `--config_file [FILE]`      Path to Processing.txt or similar config file (mutually exclusive with --sites)
 - `--parent_dir [DIR]`        Parent directory containing site folders
 - `--max_workers [N]`         Number of parallel processes (default: 4)
 - All single-site options can be used in batch mode
@@ -169,7 +220,12 @@ python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_p
 python EDL_Process.py --input_dir HDD5449 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --remote_reference HDD5974 --perform_freq_analysis WMS --plot_heatmaps --run_lemimt
 ```
 
-#### Batch, All Sites, Parallel, Save Everything
+#### Batch Processing with Configuration File (Recommended)
+```bash
+python EDL_Batch.py --config_file Processing.txt --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
+```
+
+#### Batch Processing with Manual Site Listing
 ```bash
 python EDL_Batch.py --sites HDD5449 HDD5456 HDD5470 HDD5974 --plot_data --save_plots --save_processed_data --apply_drift_correction --apply_rotation --tilt_correction --max_workers 4
 ```
@@ -195,3 +251,5 @@ python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --perform_freq_analysi
 - For timezone issues, use `--timezone "Australia/Adelaide"` or your local zone.
 - For remote reference, ensure both sites are present and have valid data.
 - For more help, run `python EDL_Process.py --help` or `python EDL_Batch.py --help`.
+
+---
