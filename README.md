@@ -40,6 +40,11 @@ The project expects the following directory and file organization:
 │   │   ├── EDL_041020000000.gps
 │   │   ├── EDL_041020000000.gst
 │   │   ├── EDL_041020000000.pll
+│   │   ├── EDL_041020000000.BX
+│   │   ├── EDL_041020000000.BY
+│   │   ├── EDL_041020000000.BZ
+│   │   ├── EDL_041020000000.EX
+│   │   ├── EDL_041020000000.EY
 │   │   └── ...
 │   ├── 295/
 │   │   ├── EDL_041021000000.ambientTemperature
@@ -52,10 +57,6 @@ The project expects the following directory and file organization:
 │   ├── l120new.rsp
 │   ├── e000.rsp
 │   └── ...
-├── Working_Backup/
-│   ├── EDL_Process.py
-│   ├── EDL_Batch.py
-│   └── EDL_Reader.py
 ├── lemimt.exe
 └── ...
 ```
