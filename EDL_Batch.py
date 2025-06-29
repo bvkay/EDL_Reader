@@ -34,7 +34,7 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
                         save_processed_data, remote_reference=None, apply_filtering=False,
                         filter_type="comb", filter_channels=None, filter_params=None,
                         plot_heatmaps=False, heatmap_nperseg=1024, heatmap_noverlap=None, heatmap_thresholds=None,
-                        site_config=None):
+                        site_config=None, run_lemimt=False, lemimt_path="lemimt.exe"):
     """Process a single site with the given parameters.
     
     Args:
@@ -73,6 +73,8 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
         heatmap_noverlap (int): Number of points to overlap between heatmap segments
         heatmap_thresholds (dict): Custom coherence thresholds for heatmap quality scoring
         site_config (dict): Site-specific configuration from Processing.txt
+        run_lemimt (bool): Whether to run lemimt.exe on the processed output file
+        lemimt_path (str): Full path to the lemimt.exe executable
     
     Returns:
         dict: Processing results for the site
@@ -87,7 +89,7 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
                 remote_reference = site_remote_ref
                 write_site_log(f"Using site-specific remote reference: {remote_reference}")
         
-        # Create processor instance
+        # Create processor
         processor = ProcessASCII(
             input_dir=os.path.join(parent_dir, site),
             param_file="config/recorder.ini",
@@ -124,8 +126,10 @@ def process_single_site(site, parent_dir, apply_drift_correction, apply_rotation
             heatmap_noverlap=heatmap_noverlap,
             heatmap_thresholds=heatmap_thresholds
         )
-        processor.tilt_correction = tilt_correction
-        processor.save_plots = save_plots
+        
+        # Set lemimt parameters
+        processor.run_lemimt = run_lemimt
+        processor.lemimt_path = lemimt_path
         
         # Override metadata with site-specific config if available
         if site_config:
@@ -155,7 +159,7 @@ def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotatio
                         save_processed_data, remote_reference=None, apply_filtering=False,
                         filter_type="comb", filter_channels=None, filter_params=None,
                         plot_heatmaps=False, heatmap_nperseg=1024, heatmap_noverlap=None, heatmap_thresholds=None,
-                        site_configs=None):
+                        site_configs=None, run_lemimt=False, lemimt_path="lemimt.exe"):
     """Process multiple sites in parallel.
     
     Args:
@@ -195,6 +199,8 @@ def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotatio
         heatmap_noverlap (int): Number of points to overlap between heatmap segments
         heatmap_thresholds (dict): Custom coherence thresholds for heatmap quality scoring
         site_configs (dict): Dictionary mapping site names to their configurations
+        run_lemimt (bool): Whether to run lemimt.exe on the processed output file
+        lemimt_path (str): Full path to the lemimt.exe executable
     
     Returns:
         dict: Dictionary mapping site names to results
@@ -223,7 +229,7 @@ def batch_process_sites(sites, parent_dir, apply_drift_correction, apply_rotatio
                 save_processed_data, remote_reference, apply_filtering,
                 filter_type, filter_channels, filter_params,
                 plot_heatmaps, heatmap_nperseg, heatmap_noverlap, heatmap_thresholds,
-                site_config
+                site_config, run_lemimt, lemimt_path
             )
             future_to_site[future] = site
         
@@ -315,6 +321,12 @@ def main():
     parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="Number of points per segment for heatmap FFT")
     parser.add_argument("--heatmap_noverlap", type=int, help="Number of points to overlap between heatmap segments")
     parser.add_argument("--heatmap_thresholds", help="Custom coherence thresholds for heatmap quality scoring")
+    
+    # LEMIMT.EXE integration
+    parser.add_argument("--run_lemimt", action="store_true", default=False,
+                        help="Run lemimt.exe on the processed output file after processing is complete")
+    parser.add_argument("--lemimt_path", type=str, default="lemimt.exe",
+                        help="Full path to the lemimt.exe executable (default: lemimt.exe in current directory)")
     
     # Logging
     parser.add_argument("--log_level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO", help="Log level")
@@ -426,7 +438,9 @@ def main():
         heatmap_nperseg=args.heatmap_nperseg,
         heatmap_noverlap=args.heatmap_noverlap,
         heatmap_thresholds=heatmap_thresholds,
-        site_configs=site_configs
+        site_configs=site_configs,
+        run_lemimt=args.run_lemimt,
+        lemimt_path=args.lemimt_path
     )
     
     # Print final summary
