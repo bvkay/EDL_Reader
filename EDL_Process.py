@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 import datetime
 import matplotlib.pyplot as plt
-from scipy.signal import welch, coherence, spectrogram  # Added spectrogram
+from matplotlib.patches import Rectangle
+from scipy.signal import welch, coherence, spectrogram, butter, filtfilt, iirnotch, lfilter  # Added filtering functions
 from EDL_Reader import ASCIIReader  # Updated ASCII reader module
 import configparser
 import re
@@ -23,6 +24,92 @@ SITE_NAME = "Unknown"  # Current site being processed
 
 # Main log file for batch processing
 MAIN_LOG_FILE = "process_ascii.log"
+
+# Global metadata collection for summary table
+PROCESSING_SUMMARY = {}
+
+def print_processing_header(processing_type="MT PROCESSING"):
+    """Print a clear header for the processing run."""
+    header = f"""
+{'='*60}
+{'='*20} {processing_type} {'='*20}
+{'='*60}
+"""
+    print(header)
+    write_log(header.strip())
+
+def create_processing_summary_table(site_name, metadata_dict):
+    """Create a comprehensive summary table for the processing results.
+    
+    Args:
+        site_name (str): Name of the site processed
+        metadata_dict (dict): Dictionary containing all processing metadata
+    """
+    summary = f"""
+{'='*80}
+PROCESSING SUMMARY FOR {site_name}
+{'='*80}
+
+SITE CONFIGURATION:
+{'-'*40}
+Site Name:           {site_name}
+X Dipole Length:     {metadata_dict.get('xarm', 'N/A')} m
+Y Dipole Length:     {metadata_dict.get('yarm', 'N/A')} m
+Remote Reference:    {metadata_dict.get('remote_reference', 'None')}
+Sample Rate:         {metadata_dict.get('sample_rate', 'N/A')} Hz
+Active Channels:     {', '.join(metadata_dict.get('active_channels', []))}
+
+LOCATION & TIMING:
+{'-'*40}
+Latitude:            {metadata_dict.get('latitude', 'N/A')}°
+Longitude:           {metadata_dict.get('longitude', 'N/A')}°
+Elevation:           {metadata_dict.get('elevation', 'N/A')} m
+Start Time:          {metadata_dict.get('start_time', 'N/A')}
+End Time:            {metadata_dict.get('end_time', 'N/A')}
+Timezone:            {metadata_dict.get('timezone', 'N/A')}
+Duration:            {metadata_dict.get('duration', 'N/A')}
+
+DATA STATISTICS:
+{'-'*40}
+Total Files:         {metadata_dict.get('total_files', 'N/A')}
+Data Points:         {metadata_dict.get('data_points', 'N/A'):,}
+Data Shape:          {metadata_dict.get('data_shape', 'N/A')}
+
+CHANNEL MEANS (nT for magnetic, mV/km for electric):
+{'-'*40}"""
+    
+    # Add channel means
+    channel_means = metadata_dict.get('channel_means', {})
+    for channel, mean_val in channel_means.items():
+        summary += f"\n{channel:15} {mean_val:10.2f}"
+    
+    # Add field strengths
+    field_strengths = metadata_dict.get('field_strengths', {})
+    if field_strengths:
+        summary += f"\n\nFIELD STRENGTHS:"
+        summary += f"\n{'-'*40}"
+        for field_type, value in field_strengths.items():
+            summary += f"\n{field_type:20} {value:10.2f} nT"
+    
+    # Add corrections applied
+    corrections = metadata_dict.get('corrections_applied', [])
+    if corrections:
+        summary += f"\n\nCORRECTIONS APPLIED:"
+        summary += f"\n{'-'*40}"
+        for correction in corrections:
+            summary += f"\n• {correction}"
+    
+    # Add tilt correction angles if applied
+    tilt_angles = metadata_dict.get('tilt_angles', {})
+    if tilt_angles:
+        summary += f"\n\nTILT CORRECTION ANGLES:"
+        summary += f"\n{'-'*40}"
+        for angle_type, angle_val in tilt_angles.items():
+            summary += f"\n{angle_type:25} {angle_val:8.2f}°"
+    
+    summary += f"\n\n{'='*80}\n"
+    
+    return summary
 
 def set_log_level(level):
     """Set the global log level."""
@@ -383,7 +470,9 @@ def smooth_outlier_points(df, channels=["Bx", "By", "Bz", "Ex", "Ey"], window=50
     outlier_info = {}
     for ch in channels:
         mask = detect_outliers(df[ch], window=window, threshold=threshold)
-        intervals = get_intervals_from_mask(mask, df["time"])
+        # Use datetime column if available, otherwise use index
+        time_col = df["datetime"] if "datetime" in df.columns else df.index
+        intervals = get_intervals_from_mask(mask, time_col)
         outlier_info[ch] = intervals
         df[ch] = smooth_outliers(df[ch], mask)
     return df, outlier_info
@@ -619,9 +708,14 @@ def plot_coherence_plots(df, fs, nperseg=1024, save_plots=False, site_name="Unkn
             write_log(f"No valid coherence pairs found for {site_name}", level="WARNING")
             return
         
-        fig, axes = plt.subplots(len(pairs), 1, figsize=(12, 3*len(pairs)))
-        if len(pairs) == 1:
-            axes = [axes]
+        # Create figure with subplots for each pair
+        n_pairs = len(pairs)
+        fig_height = 4 * n_pairs  # 4 inches per pair
+        fig, axes = plt.subplots(n_pairs, 2, figsize=(12, fig_height))  # Changed from 3 to 2 columns
+        
+        # Handle single pair case
+        if n_pairs == 1:
+            axes = axes.reshape(1, -1)
         
         for i, (ch1, ch2) in enumerate(pairs):
             if ch1 in df.columns and ch2 in df.columns:
@@ -634,21 +728,30 @@ def plot_coherence_plots(df, fs, nperseg=1024, save_plots=False, site_name="Unkn
                     data2 = data2[:min_len]
                     
                     f, Cxy = coherence(data1, data2, fs=fs, nperseg=min(nperseg, min_len//2))
-                    axes[i].plot(f, Cxy)
-                    axes[i].set_xlabel('Frequency [Hz]')
-                    axes[i].set_ylabel('Coherence')
-                    axes[i].set_title(f'{ch1}-{ch2} Coherence - {site_name}')
-                    axes[i].grid(True)
-                    axes[i].set_ylim(0, 1)
+                    axes[i, 0].plot(f, Cxy)
+                    axes[i, 0].set_xlabel('Frequency [Hz]')
+                    axes[i, 0].set_ylabel('Coherence')
+                    axes[i, 0].set_title(f'{ch1}-{ch2} Coherence - {site_name}')
+                    axes[i, 0].grid(True)
+                    axes[i, 0].set_ylim(0, 1)
+                    
+                    # Add subplot for filter response
+                    axes[i, 1].plot(f, np.abs(Cxy))
+                    axes[i, 1].set_xlabel('Frequency [Hz]')
+                    axes[i, 1].set_ylabel('Magnitude')
+                    axes[i, 1].set_title(f'{ch1}-{ch2} Filter Response - {site_name}')
+                    axes[i, 1].grid(True)
                 else:
-                    axes[i].text(0.5, 0.5, f'No data for {ch1}-{ch2}', ha='center', va='center', transform=axes[i].transAxes)
+                    axes[i, 0].text(0.5, 0.5, f'No data for {ch1}-{ch2}', ha='center', va='center', transform=axes[i, 0].transAxes)
+                    axes[i, 1].text(0.5, 0.5, f'No data for {ch1}-{ch2}', ha='center', va='center', transform=axes[i, 1].transAxes)
             else:
                 missing = []
                 if ch1 not in df.columns:
                     missing.append(ch1)
                 if ch2 not in df.columns:
                     missing.append(ch2)
-                axes[i].text(0.5, 0.5, f'Channels not found: {missing}', ha='center', va='center', transform=axes[i].transAxes)
+                axes[i, 0].text(0.5, 0.5, f'Channels not found: {missing}', ha='center', va='center', transform=axes[i, 0].transAxes)
+                axes[i, 1].text(0.5, 0.5, f'Channels not found: {missing}', ha='center', va='center', transform=axes[i, 1].transAxes)
         
         plt.tight_layout()
         
@@ -1368,7 +1471,9 @@ class ProcessASCII:
                  log_first_rows=False, smoothing_method="median", sens_start=0, sens_end=5000,
                  skip_minutes=[0, 0], apply_drift_correction=False, apply_rotation=False,
                  plot_drift=False, plot_rotation=False, plot_tilt=False, timezone="UTC", plot_original_data=False,
-                 save_raw_data=False, save_processed_data=False, remote_reference=None):
+                 save_raw_data=False, save_processed_data=False, remote_reference=None,
+                 apply_filtering=False, filter_type="comb", filter_channels=None, filter_params=None,
+                 plot_heatmaps=False, heatmap_nperseg=1024, heatmap_noverlap=None, heatmap_thresholds=None):
         """
         Initialize the ProcessASCII class.
         
@@ -1399,6 +1504,14 @@ class ProcessASCII:
             save_raw_data (bool): Whether to save raw data.
             save_processed_data (bool): Whether to save processed data.
             remote_reference (str, optional): Remote reference site name.
+            apply_filtering (bool): Whether to apply frequency filtering.
+            filter_type (str): Type of filter ("comb", "bandpass", "highpass", "lowpass", "adaptive", "custom").
+            filter_channels (list, optional): Channels to filter. If None, filters all main channels.
+            filter_params (dict, optional): Additional filter parameters.
+            plot_heatmaps (bool): Whether to generate heatmap plots for quality control.
+            heatmap_nperseg (int): Number of points per segment for heatmap FFT.
+            heatmap_noverlap (int, optional): Number of points to overlap between heatmap segments.
+            heatmap_thresholds (dict, optional): Custom coherence thresholds for heatmap quality scoring.
         """
         self.input_dir = input_dir
         self.param_file = param_file
@@ -1426,6 +1539,14 @@ class ProcessASCII:
         self.save_raw_data = save_raw_data
         self.save_processed_data = save_processed_data
         self.remote_reference = remote_reference
+        self.apply_filtering = apply_filtering
+        self.filter_type = filter_type
+        self.filter_channels = filter_channels or ["Bx", "By", "Bz", "Ex", "Ey"]
+        self.filter_params = filter_params or {}
+        self.plot_heatmaps = plot_heatmaps
+        self.heatmap_nperseg = heatmap_nperseg
+        self.heatmap_noverlap = heatmap_noverlap
+        self.heatmap_thresholds = heatmap_thresholds
         
         # Extract site name from input directory
         self.site_name = os.path.basename(os.path.abspath(input_dir))
@@ -1444,6 +1565,30 @@ class ProcessASCII:
             'end_time': None
         }
         
+        # Initialize metadata collection for summary table
+        self.summary_metadata = {
+            'site_name': self.site_name,
+            'xarm': None,
+            'yarm': None,
+            'remote_reference': remote_reference,
+            'sample_rate': None,
+            'active_channels': [],
+            'latitude': None,
+            'longitude': None,
+            'elevation': None,
+            'start_time': None,
+            'end_time': None,
+            'timezone': timezone,
+            'duration': None,
+            'total_files': 0,
+            'data_points': 0,
+            'data_shape': None,
+            'channel_means': {},
+            'field_strengths': {},
+            'corrections_applied': [],
+            'tilt_angles': {}
+        }
+        
         # Read Processing.txt configuration
         self.processing_config = read_processing_config()
         
@@ -1455,9 +1600,13 @@ class ProcessASCII:
             site_config = self.processing_config[self.site_name]
             self.metadata['xarm'] = site_config['xarm']
             self.metadata['yarm'] = site_config['yarm']
-            write_site_log(f"Using Processing.txt config: xarm={site_config['xarm']} m, yarm={site_config['yarm']}")
+            # Update summary metadata
+            self.summary_metadata['xarm'] = site_config['xarm']
+            self.summary_metadata['yarm'] = site_config['yarm']
         else:
-            write_site_log(f"No Processing.txt config found, using default metadata", level="WARNING")
+            # Use default metadata
+            self.summary_metadata['xarm'] = self.metadata.get('xarm', 100.0)
+            self.summary_metadata['yarm'] = self.metadata.get('yarm', 100.0)
         
         self.tilt_correction = False  # Set via command-line.
         self.save_plots = False   # Set via command-line.
@@ -1484,6 +1633,7 @@ class ProcessASCII:
             
             # Extract channel information
             channels = {}
+            active_channels = []
             for i in range(22):  # Check for channels 0-21
                 long_id_key = f'channel_{i}_long_id'
                 short_id_key = f'channel_{i}_short_id'
@@ -1497,6 +1647,8 @@ class ProcessASCII:
                         'samplerate': int(recorder_section.get(samplerate_key, 0)),
                         'format': recorder_section.get(format_key, 'ascii')
                     }
+                    if channels[i]['samplerate'] > 0:
+                        active_channels.append(recorder_section[long_id_key])
             
             metadata['channels'] = channels
             
@@ -1509,8 +1661,13 @@ class ProcessASCII:
             
             if sample_rates:
                 metadata['sample_interval'] = 1.0 / sample_rates[0]  # Use first non-zero sample rate
+                self.summary_metadata['sample_rate'] = sample_rates[0]
             else:
                 metadata['sample_interval'] = 0.1  # Default to 10 Hz if not found
+                self.summary_metadata['sample_rate'] = 10.0
+            
+            # Update summary metadata
+            self.summary_metadata['active_channels'] = active_channels
             
             # Set default values for processing parameters
             metadata['xarm'] = 100.0  # Default dipole length in meters
@@ -1530,10 +1687,6 @@ class ProcessASCII:
             }
             metadata['finish_time'] = metadata['start_time'].copy()
             
-            write_log(f"[{self.site_name}] Metadata successfully loaded from {config_file_path}")
-            write_log(f"[{self.site_name}] Sample interval: {metadata['sample_interval']} seconds")
-            write_log(f"[{self.site_name}] Active channels: {[ch['long_id'] for ch in channels.values() if ch['samplerate'] > 0]}")
-            
         except Exception as e:
             write_log(f"[{self.site_name}] Error reading metadata file {self.param_file} from {self.input_dir}: {e}", level="ERROR")
             # Set minimal default metadata
@@ -1545,35 +1698,28 @@ class ProcessASCII:
                 'time_drift': 0,
                 'channels': {}
             }
+            self.summary_metadata['sample_rate'] = 10.0
         return metadata
 
     def process_all_files(self):
         """Process all ASCII files in the input directory."""
         try:
+            # Print processing header
+            print_processing_header("MT PROCESSING")
+            
             self.results['status'] = 'PROCESSING'
             write_site_log(f"Processing site: {self.site_name}")
             
             # Extract GPS coordinates
             gps_file_path = find_gps_file(self.input_dir, self.site_name)
-            gps_data = None
+            self.gps_data = None  # Store as instance attribute
             if gps_file_path:
-                write_site_log(f"Found GPS file: {gps_file_path}")
-                gps_data = extract_gps_coordinates(gps_file_path)
-                if gps_data:
-                    gps_info = []
-                    if 'latitude' in gps_data and 'longitude' in gps_data:
-                        gps_info.append(f"Lat: {gps_data['latitude']:.6f}°")
-                        gps_info.append(f"Lon: {gps_data['longitude']:.6f}°")
-                    if 'altitude' in gps_data:
-                        gps_info.append(f"Alt: {gps_data['altitude']:.1f} m")
-                    if gps_info:
-                        write_site_log(f"GPS coordinates for {self.site_name}: {', '.join(gps_info)}")
-                    else:
-                        write_site_log(f"No valid GPS coordinates found for {self.site_name}")
-                else:
-                    write_site_log(f"Failed to extract GPS coordinates for {self.site_name}")
-            else:
-                write_site_log(f"No GPS file found for {self.site_name}")
+                self.gps_data = extract_gps_coordinates(gps_file_path)
+                if self.gps_data:
+                    # Update summary metadata
+                    self.summary_metadata['latitude'] = self.gps_data.get('latitude')
+                    self.summary_metadata['longitude'] = self.gps_data.get('longitude')
+                    self.summary_metadata['elevation'] = self.gps_data.get('altitude')
             
             # Load ASCII data
             reader = ASCIIReader(self.input_dir, self.metadata, self.average, self.log_first_rows)
@@ -1585,14 +1731,19 @@ class ProcessASCII:
                 self.results['error'] = 'No data files found'
                 return
             
-            write_site_log(f"All ASCII files loaded and concatenated successfully")
-            write_site_log(f"Data shape: {combined_raw_df.shape}")
-            write_site_log(f"Data columns: {list(combined_raw_df.columns)}")
+            # Update summary metadata
+            self.summary_metadata['data_shape'] = combined_raw_df.shape
+            self.summary_metadata['data_points'] = len(combined_raw_df)
             
-            # Check for NaN values
-            n_nans = combined_raw_df.isnull().sum().sum()
-            if n_nans > 0:
-                write_site_log(f"WARNING: Found {n_nans} NaN values in raw data", level="WARNING")
+            # Count total files
+            total_files = 0
+            for channel in ['BX', 'BY', 'BZ', 'EX', 'EY']:
+                pattern = os.path.join(self.input_dir, "**", f"*.{channel}")
+                files = glob.glob(pattern, recursive=True)
+                total_files += len(files)
+            self.summary_metadata['total_files'] = total_files
+            
+            write_site_log(f"Loaded {total_files} files, {len(combined_raw_df):,} data points")
             
             # Save raw data if requested
             if self.save_raw_data:
@@ -1604,7 +1755,6 @@ class ProcessASCII:
             
             # Build time column
             sample_interval = self.metadata.get('sample_interval', 1.0)
-            write_site_log(f"Building time column with sample_interval: {sample_interval}")
             
             # Find first file to extract start time
             station_identifier = self.metadata.get('station_long_identifier', 'EDL_')
@@ -1614,23 +1764,17 @@ class ProcessASCII:
             
             if bx_files:
                 first_file = sorted(bx_files)[0]
-                write_site_log(f"Using first file: {first_file}")
                 
                 # Extract start time from filename
                 start_datetime = extract_datetime_from_filename(os.path.basename(first_file))
                 
                 if start_datetime:
-                    write_site_log(f"Extracted start time from filename: {start_datetime}")
-                    
                     # Apply GPS week rollover correction if needed
                     original_time = start_datetime
                     if start_datetime.year < 2020:  # Likely GPS week rollover issue
                         gps_week_rollover = datetime.timedelta(weeks=1024)  # 19.7 years
                         start_datetime = start_datetime + gps_week_rollover
-                        write_site_log(f"GPS week rollover correction applied:")
-                        write_site_log(f"  Original (wrong): {original_time}")
-                        write_site_log(f"  Corrected (actual): {start_datetime}")
-                        write_site_log(f"  Correction: +{gps_week_rollover.days} days ({gps_week_rollover.days * 24} hours)")
+                        write_site_log(f"Applied GPS week rollover correction: {original_time} → {start_datetime}")
                     
                     # Convert timezone if requested
                     if self.timezone[0] != "UTC":
@@ -1639,7 +1783,6 @@ class ProcessASCII:
                             utc_tz = pytz.UTC
                             target_tz = pytz.timezone(self.timezone[0])
                             start_datetime = utc_tz.localize(start_datetime).astimezone(target_tz)
-                            write_site_log(f"Converted start time to {self.timezone[0]}: {start_datetime}")
                         except ImportError:
                             write_site_log(f"pytz not available, using UTC timezone", level="WARNING")
                         except Exception as e:
@@ -1650,7 +1793,13 @@ class ProcessASCII:
                         start_datetime + datetime.timedelta(seconds=i * sample_interval)
                         for i in range(len(combined_raw_df))
                     ]
-                    write_site_log(f"Built datetime column from {start_datetime} to {combined_raw_df['datetime'].iloc[-1]}")
+                    
+                    # Update summary metadata
+                    self.summary_metadata['start_time'] = start_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                    self.summary_metadata['end_time'] = combined_raw_df['datetime'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+                    self.summary_metadata['duration'] = str(combined_raw_df['datetime'].iloc[-1] - start_datetime)
+                    
+                    write_site_log(f"Time range: {self.summary_metadata['start_time']} to {self.summary_metadata['end_time']}")
                 else:
                     write_site_log(f"Failed to extract datetime from filename, using simple time column", level="WARNING")
                     combined_raw_df['datetime'] = [
@@ -1658,7 +1807,7 @@ class ProcessASCII:
                         for i in range(len(combined_raw_df))
                     ]
             else:
-                write_site_log(f"No BX files found with pattern '{station_identifier}*.BX', using simple time column", level="WARNING")
+                write_site_log(f"No BX files found, using simple time column", level="WARNING")
                 combined_raw_df['datetime'] = [
                     datetime.datetime.now() + datetime.timedelta(seconds=i * sample_interval)
                     for i in range(len(combined_raw_df))
@@ -1670,43 +1819,33 @@ class ProcessASCII:
                 original_start = combined_raw_df['datetime'].min()
                 new_start = original_start + skip_timedelta
                 combined_raw_df = combined_raw_df[combined_raw_df['datetime'] >= new_start]
-                write_site_log(f"Skipping first {self.skip_minutes[0]} minutes (from {original_start} to {new_start})")
-                write_site_log(f"Data shape after skipping start: {combined_raw_df.shape}")
+                write_site_log(f"Skipped first {self.skip_minutes[0]} minutes")
             
             if self.skip_minutes[1] > 0:
                 skip_timedelta = datetime.timedelta(minutes=self.skip_minutes[1])
                 original_end = combined_raw_df['datetime'].max()
                 new_end = original_end - skip_timedelta
                 combined_raw_df = combined_raw_df[combined_raw_df['datetime'] <= new_end]
-                write_site_log(f"Skipping last {self.skip_minutes[1]} minutes (from {new_end} to {original_end})")
-                write_site_log(f"Data shape after skipping end: {combined_raw_df.shape}")
+                write_site_log(f"Skipped last {self.skip_minutes[1]} minutes")
             
             # Convert to physical units
-            write_site_log(f"Converting ASCII data from raw counts to physical units...")
+            write_site_log(f"Converting to physical units...")
             processed_df = self.convert_ascii_to_physical_units(combined_raw_df)
-            write_site_log(f"ASCII data converted from raw counts to physical units.")
-            write_site_log(f"Processed data shape: {processed_df.shape}")
-            
-            # Check for NaN values after conversion
-            n_nans = processed_df.isnull().sum().sum()
-            if n_nans > 0:
-                write_site_log(f"WARNING: Found {n_nans} NaN values after conversion", level="WARNING")
             
             # Load remote reference data if requested
             if self.remote_reference:
-                write_site_log(f"Starting remote reference processing with {self.remote_reference}")
+                write_site_log(f"Loading remote reference: {self.remote_reference}")
                 remote_ref_site = self.remote_reference
                 remote_ref_dir = os.path.join(os.path.dirname(self.input_dir), remote_ref_site)
                 
                 # Determine timezone for remote reference
                 remote_timezone = self.timezone[1] if len(self.timezone) > 1 else self.timezone[0]
-                write_site_log(f"Using timezone '{remote_timezone}' for remote reference site")
                 
                 if os.path.exists(remote_ref_dir):
                     remote_df, remote_gps_data, distance_km = load_remote_reference_data(
                         remote_ref_site, remote_ref_dir, 
                         processed_df['datetime'].min(), processed_df['datetime'].max(),
-                        sample_interval, gps_data, remote_timezone
+                        sample_interval, self.gps_data, remote_timezone
                     )
                     
                     if remote_df is not None and not remote_df.empty:
@@ -1718,15 +1857,14 @@ class ProcessASCII:
                                 remote_tz = pytz.timezone(remote_timezone)
                                 main_tz = pytz.timezone(self.timezone[0])
                                 remote_df['datetime'] = remote_df['datetime'].dt.tz_localize(remote_tz).dt.tz_convert(main_tz)
-                                write_site_log(f"Converted remote reference timezone from {remote_timezone} to {self.timezone[0]}")
                             except Exception as e:
                                 write_site_log(f"Error converting remote reference timezone: {e}", level="WARNING")
                         
                         processed_df = merge_with_remote_reference(processed_df, remote_df)
                         if 'rBx' in processed_df.columns:
-                            write_site_log(f"Remote reference data merged successfully")
+                            write_site_log(f"Remote reference merged successfully")
                         else:
-                            write_site_log(f"Remote reference merge failed - no rBx column found", level="WARNING")
+                            write_site_log(f"Remote reference merge failed", level="WARNING")
                     else:
                         write_site_log(f"No remote reference data available", level="WARNING")
                 else:
@@ -1734,9 +1872,9 @@ class ProcessASCII:
             
             # Apply decimation if requested
             if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
-                write_site_log(f"Applying decimation factor: {self.decimation_factor}")
+                write_site_log(f"Applying {self.decimation_factor}x decimation...")
                 processed_df, sample_interval = decimate_dataframe(processed_df, self.decimation_factor, sample_interval)
-                write_site_log(f"Decimation applied. New sample interval: {sample_interval:.3f}s")
+                self.summary_metadata['sample_rate'] = 1.0 / sample_interval
             
             # Preserve original columns before tilt correction if plotting tilt
             if self.plot_tilt:
@@ -1749,7 +1887,6 @@ class ProcessASCII:
                 if 'rBy' in processed_df.columns:
                     processed_df['rBy_original'] = processed_df['rBy'].copy()
 
-            
             # Apply tilt correction
             tilt_angle_degrees = None
             remote_tilt_angle = None
@@ -1758,13 +1895,14 @@ class ProcessASCII:
                 include_remote = self.tilt_correction == "RR" and 'rBx' in processed_df.columns and 'rBy' in processed_df.columns
                 processed_df, tilt_angle_degrees = tilt_correction(processed_df, include_remote_reference=include_remote)
                 
+                # Update summary metadata
+                self.summary_metadata['corrections_applied'].append("Tilt correction")
+                self.summary_metadata['tilt_angles']['Main site'] = tilt_angle_degrees
+                
                 # Extract remote tilt angle if available
                 if include_remote and 'rBx' in processed_df.columns and 'rBy' in processed_df.columns:
                     remote_tilt_angle = np.degrees(np.arctan2(processed_df['rBy'].mean(), processed_df['rBx'].mean()))
-                    write_site_log(f"Applied tilt correction to remote reference channels: {remote_tilt_angle:.2f} degrees")
-                
-                write_site_log(f"Applied tilt correction to main channels: {tilt_angle_degrees:.2f} degrees")
-                write_site_log(f"Tilt correction applied successfully: {tilt_angle_degrees:.2f} degrees")
+                    self.summary_metadata['tilt_angles']['Remote reference'] = remote_tilt_angle
             
             # Apply smoothing if requested
             if self.apply_smoothing:
@@ -1773,7 +1911,117 @@ class ProcessASCII:
                     processed_df, _ = smooth_median_mad(processed_df, window=self.smoothing_window, threshold=self.threshold_factor)
                 elif self.smoothing_method == "adaptive":
                     processed_df, _ = smooth_adaptive(processed_df, min_window=3, max_window=self.smoothing_window, threshold=self.threshold_factor)
-                write_site_log(f"Smoothing applied successfully")
+                self.summary_metadata['corrections_applied'].append(f"{self.smoothing_method.capitalize()} smoothing")
+            
+            # Apply frequency filtering if requested
+            if self.apply_filtering:
+                write_site_log(f"Applying {self.filter_type} filtering...")
+                
+                # Create filter configuration
+                filter_config = {
+                    'type': self.filter_type,
+                    'channels': self.filter_channels,
+                    'method': 'filtfilt'  # Use zero-phase filtering by default
+                }
+                
+                # Add filter-specific parameters
+                if self.filter_type == 'comb':
+                    filter_config.update({
+                        'notch_freq': self.filter_params.get('notch_freq', 50.0),
+                        'quality_factor': self.filter_params.get('quality_factor', 30.0),
+                        'harmonics': self.filter_params.get('harmonics', None)
+                    })
+                elif self.filter_type == 'bandpass':
+                    filter_config.update({
+                        'low_freq': self.filter_params.get('low_freq', 0.1),
+                        'high_freq': self.filter_params.get('high_freq', 10.0),
+                        'order': self.filter_params.get('order', 4)
+                    })
+                elif self.filter_type == 'highpass':
+                    filter_config.update({
+                        'cutoff_freq': self.filter_params.get('cutoff_freq', 0.1),
+                        'order': self.filter_params.get('order', 4)
+                    })
+                elif self.filter_type == 'lowpass':
+                    filter_config.update({
+                        'cutoff_freq': self.filter_params.get('cutoff_freq', 10.0),
+                        'order': self.filter_params.get('order', 4)
+                    })
+                elif self.filter_type == 'adaptive':
+                    filter_config.update({
+                        'reference_channel': self.filter_params.get('reference_channel', 'rBx'),
+                        'filter_length': self.filter_params.get('filter_length', 64),
+                        'mu': self.filter_params.get('mu', 0.01)
+                    })
+                elif self.filter_type == 'custom':
+                    filter_config.update({
+                        'b': self.filter_params.get('b', [1.0]),
+                        'a': self.filter_params.get('a', [1.0])
+                    })
+                
+                # Apply the filter
+                fs = 1.0 / sample_interval
+                processed_df = filter_data(processed_df, filter_config, fs)
+                
+                # Update summary metadata
+                filter_description = f"{self.filter_type.capitalize()} filtering"
+                if self.filter_type == 'comb':
+                    notch_freq = filter_config.get('notch_freq', 50.0)
+                    filter_description += f" (notch at {notch_freq} Hz)"
+                elif self.filter_type == 'bandpass':
+                    low_freq = filter_config.get('low_freq', 0.1)
+                    high_freq = filter_config.get('high_freq', 10.0)
+                    filter_description += f" ({low_freq}-{high_freq} Hz)"
+                elif self.filter_type == 'highpass':
+                    cutoff_freq = filter_config.get('cutoff_freq', 0.1)
+                    filter_description += f" (cutoff: {cutoff_freq} Hz)"
+                elif self.filter_type == 'lowpass':
+                    cutoff_freq = filter_config.get('cutoff_freq', 10.0)
+                    filter_description += f" (cutoff: {cutoff_freq} Hz)"
+                
+                self.summary_metadata['corrections_applied'].append(filter_description)
+                
+                # Plot filter response if requested
+                if self.save_plots and self.filter_type != 'adaptive':
+                    try:
+                        # Get filter coefficients for plotting
+                        if self.filter_type == 'comb':
+                            b, a = design_comb_filter(fs, 
+                                                    filter_config.get('notch_freq', 50.0),
+                                                    filter_config.get('quality_factor', 30.0),
+                                                    filter_config.get('harmonics', None))
+                        elif self.filter_type == 'bandpass':
+                            b, a = design_bandpass_filter(fs,
+                                                        filter_config.get('low_freq', 0.1),
+                                                        filter_config.get('high_freq', 10.0),
+                                                        filter_config.get('order', 4))
+                        elif self.filter_type == 'highpass':
+                            b, a = design_highpass_filter(fs,
+                                                        filter_config.get('cutoff_freq', 0.1),
+                                                        filter_config.get('order', 4))
+                        elif self.filter_type == 'lowpass':
+                            b, a = design_lowpass_filter(fs,
+                                                       filter_config.get('cutoff_freq', 10.0),
+                                                       filter_config.get('order', 4))
+                        else:
+                            b, a = np.array([1.0]), np.array([1.0])
+                        
+                        plot_filter_response(b, a, fs, f"{self.filter_type.capitalize()} Filter", 
+                                           save_plot=True, output_dir=self.output_dir)
+                    except Exception as e:
+                        write_site_log(f"Error plotting filter response: {e}", level="WARNING")
+            
+            # Calculate channel means and field strengths
+            for col in processed_df.columns:
+                if col in ['Bx', 'By', 'Bz', 'Ex', 'Ey', 'rBx', 'rBy'] and col in processed_df.columns:
+                    self.summary_metadata['channel_means'][col] = processed_df[col].mean()
+            
+            # Calculate field strengths
+            if 'Bx' in processed_df.columns and 'By' in processed_df.columns and 'Bz' in processed_df.columns:
+                total_field = np.sqrt(processed_df['Bx']**2 + processed_df['By']**2 + processed_df['Bz']**2)
+                horizontal_field = np.sqrt(processed_df['Bx']**2 + processed_df['By']**2)
+                self.summary_metadata['field_strengths']['Total magnetic field'] = total_field.mean()
+                self.summary_metadata['field_strengths']['Horizontal magnetic field'] = horizontal_field.mean()
             
             # Save processed data if requested
             if self.save_processed_data:
@@ -1804,10 +2052,10 @@ class ProcessASCII:
                 float_cols = output_df.select_dtypes(include=['float', 'float64', 'float32']).columns
                 output_df[float_cols] = output_df[float_cols].round(3)
                 output_df.to_csv(processed_output_path, index=False, header=False, sep='\t', float_format='%.3f')
-                write_site_log(f"Processed data saved to {processed_output_path}")
+                write_site_log(f"Processed data saved: {filename}")
 
                 # Generate config file after processed data is saved
-                if gps_data:
+                if self.gps_data:
                     has_remote = self.remote_reference is not None
                     site_name_for_config = self.site_name
                     if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
@@ -1815,15 +2063,12 @@ class ProcessASCII:
                         site_name_for_config = f"{self.site_name}{suffix}"
                     config_path = generate_processing_config(
                         site_name_for_config,
-                        gps_data,
+                        self.gps_data,
                         sample_interval,
                         has_remote_reference=has_remote,
                         remote_reference_site=self.remote_reference,
                         output_file_path=processed_output_path
                     )
-                    write_site_log(f"Generated processing config file: {config_path}")
-            else:
-                write_site_log(f"Skipping saving processed data (not requested)")
             
             # Update results
             self.results['data_shape'] = processed_df.shape
@@ -1852,7 +2097,7 @@ class ProcessASCII:
                     rotated=self.apply_rotation,
                     plot_tilt=self.plot_tilt,
                     plot_original_data=self.plot_original_data,
-                    gps_data=gps_data,
+                    gps_data=self.gps_data,
                     tilt_angle_degrees=tilt_angle_degrees,
                     remote_reference_site=self.remote_reference,
                     xarm=self.metadata.get("xarm"),
@@ -1860,7 +2105,6 @@ class ProcessASCII:
                     skip_minutes=self.skip_minutes,
                     timezone=self.timezone
                 )
-                write_site_log(f"Plots generated successfully")
             
             # Perform frequency analysis if requested
             if self.perform_freq_analysis:
@@ -1873,7 +2117,6 @@ class ProcessASCII:
                     site_name_for_freq = f"{self.site_name}{suffix}"
                 
                 self.frequency_analysis(processed_df, site_name_for_freq)
-                write_site_log(f"Frequency analysis completed")
             
             # Plot coherence if requested
             if self.plot_coherence:
@@ -1892,7 +2135,48 @@ class ProcessASCII:
                     site_name=site_name_for_coherence,
                     output_dir=self.output_dir
                 )
-                write_site_log(f"Coherence plots generated successfully")
+            
+            # Generate heatmap plots if requested
+            if self.plot_heatmaps:
+                write_site_log(f"Generating heatmap plots for quality control...")
+                
+                # Add sample rate suffix to site name if decimation is applied
+                site_name_for_heatmaps = self.site_name
+                if hasattr(self, 'decimation_factor') and self.decimation_factor > 1:
+                    suffix = get_sample_rate_suffix(sample_interval)
+                    site_name_for_heatmaps = f"{self.site_name}{suffix}"
+                
+                # Parse custom thresholds if provided
+                heatmap_thresholds = self.heatmap_thresholds
+                if isinstance(heatmap_thresholds, str):
+                    try:
+                        # Parse thresholds from string format like "0.8,0.6,0.6"
+                        parts = heatmap_thresholds.split(',')
+                        if len(parts) == 3:
+                            heatmap_thresholds = {
+                                'good': float(parts[0]),
+                                'fair': float(parts[1]),
+                                'poor': float(parts[2])
+                            }
+                    except Exception as e:
+                        write_site_log(f"Error parsing heatmap thresholds: {e}, using defaults", level="WARNING")
+                        heatmap_thresholds = None
+                
+                plot_heatmaps(
+                    processed_df,
+                    fs=1.0/sample_interval,
+                    save_plots=self.save_plots,
+                    site_name=site_name_for_heatmaps,
+                    output_dir=self.output_dir,
+                    nperseg=self.heatmap_nperseg,
+                    noverlap=self.heatmap_noverlap,
+                    coherence_thresholds=heatmap_thresholds
+                )
+            
+            # Display summary table
+            summary_table = create_processing_summary_table(self.site_name, self.summary_metadata)
+            print(summary_table)
+            write_log(summary_table)
             
             write_site_log(f"Processing completed successfully for {self.site_name}")
             
@@ -2317,7 +2601,6 @@ def read_processing_config(processing_file="Processing.txt"):
                         'yarm': yarm,
                         'remote_reference': remote_ref
                     }
-                    write_log(f"Loaded processing config for {site}: xarm={xarm}, yarm={yarm}, remote_ref={remote_ref}")
         
         return config
     except FileNotFoundError:
@@ -2366,29 +2649,108 @@ def decimal_degrees_to_degrees_minutes(decimal_degrees, is_latitude=True):
     return f"{degrees} {minutes:.5f},{hemisphere}"
 
 
-def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
-                              remote_reference_site=None, output_file_path=None):
-    """Generate a processing configuration file based on the MATLAB code structure.
+def get_next_available_identifier(base_site_name, output_dir="."):
+    """Determine the next available identifier letter (A-Z) for a given base site name.
+    
+    This function checks for existing EDI files with the pattern {base_site_name}-[A-Z].edi
+    and returns the next available letter.
+    
     Args:
-        site_name (str): Name of the site being processed
-        gps_data (dict): Dictionary containing GPS coordinates and elevation
-        sample_interval (float): Sampling interval in seconds
-        has_remote_reference (bool): Whether remote reference processing is used
-        remote_reference_site (str): Name of the remote reference site
-        output_file_path (str): Full path to the processed data file (for naming .cfg)
+        base_site_name (str): Base site name (e.g., "MT_HDD5449_RR-HDD5974_10Hz")
+        output_dir (str): Directory to check for existing files
+        
     Returns:
-        str: Path to the generated config file
+        str: Next available identifier letter (A-Z)
     """
+    import glob
+    import os
+    
+    # Check for existing EDI files with this base name
+    pattern = os.path.join(output_dir, f"{base_site_name}-*.edi")
+    existing_files = glob.glob(pattern)
+    
+    # Extract used letters from existing files
+    used_letters = set()
+    for file_path in existing_files:
+        filename = os.path.basename(file_path)
+        # Extract the letter after the last dash
+        if filename.endswith('.edi'):
+            parts = filename[:-4].split('-')  # Remove .edi and split by dash
+            if len(parts) > 1:
+                last_part = parts[-1]
+                if len(last_part) == 1 and last_part.isalpha():
+                    used_letters.add(last_part.upper())
+    
+    # Find the first available letter
+    available_letters = set('ABCDEFGHIJKLMNOPQRSTUVWXYZ') - used_letters
+    if available_letters:
+        return min(available_letters)  # Return the first available letter alphabetically
+    else:
+        # If all letters are used, start over with A (this shouldn't happen in practice)
+        write_log(f"WARNING: All identifier letters A-Z are used for {base_site_name}, reusing A", level="WARNING")
+        return 'A'
+
+
+def get_next_run_letter(base_site_name, output_dir="."):
+    """Determine the next available run letter (A-Z) for a given base site name.
+    Scans for existing files and returns the next available first letter.
+    """
+    import glob
+    import os
+    pattern = os.path.join(output_dir, f"{base_site_name}-???.edi")
+    existing_files = glob.glob(pattern)
+    used_first_letters = set()
+    for file_path in existing_files:
+        filename = os.path.basename(file_path)
+        if filename.endswith('.edi') and '-' in filename:
+            dash_split = filename.rsplit('-', 1)
+            if len(dash_split) == 2:
+                identifier = dash_split[1][:3]  # Get first 3 characters
+                if len(identifier) == 3 and identifier[0].isalpha() and identifier[1:].isdigit():
+                    used_first_letters.add(identifier[0].upper())
+    for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        if letter not in used_first_letters:
+            return letter
+    # If all used, start over (shouldn't happen)
+    return 'A'
+
+def get_file_number(file_index):
+    """Get the file number (00-99) for the given file index (0-based)."""
+    if 0 <= file_index <= 99:
+        return f"{file_index:02d}"  # Format as two-digit number
+    else:
+        return "00"  # fallback
+
+
+def generate_processing_config(site_name, gps_data, sample_interval, has_remote_reference=False, 
+                              remote_reference_site=None, output_file_path=None, run_index=None, file_index=0):
+    """Generate a processing configuration file with a letter-number identifier (e.g., A00, A01, B00)."""
     if output_file_path:
         config_path = os.path.splitext(output_file_path)[0] + ".cfg"
     else:
-        # fallback for legacy calls
         suffix = get_sample_rate_suffix(sample_interval)
         config_filename = f"{site_name}{suffix}_Process.cfg"
         config_path = os.path.join(".", config_filename)
-    # Only create directory if not current dir
     if os.path.dirname(config_path) not in ("", "."):
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    config_site_name = f"MT_{site_name}"
+    if has_remote_reference and remote_reference_site:
+        config_site_name += f"_RR-{remote_reference_site}"
+    sample_rate = 1.0 / sample_interval
+    if sample_rate >= 1:
+        freq_str = f"_{int(sample_rate)}Hz"
+    else:
+        freq_str = f"_{sample_rate:.1f}Hz"
+    config_site_name += freq_str
+    # Letter-number identifier (e.g., A00, A01, B00)
+    base_site_name = config_site_name
+    output_dir = os.path.dirname(config_path) if os.path.dirname(config_path) else "."
+    if run_index is None:
+        run_letter = get_next_run_letter(base_site_name, output_dir)
+    else:
+        run_letter = run_index
+    file_number = get_file_number(file_index)
+    config_site_name += f"-{run_letter}{file_number}"
     latitude = gps_data.get('latitude', 0.0)
     longitude = gps_data.get('longitude', 0.0)
     elevation = gps_data.get('altitude', 0.0)
@@ -2403,8 +2765,10 @@ def generate_processing_config(site_name, gps_data, sample_interval, has_remote_
     C5 = '1'
     R1 = '1' if has_remote_reference else None
     R2 = '1' if has_remote_reference else None
+    write_log(f"Writing coordinates to config file: Lat={latitude:.6f}° ({latitude_dm}), Lon={longitude:.6f}° ({longitude_dm}), Elev={elevation:.1f}m")
+    write_log(f"Using config site name: {config_site_name}")
     with open(config_path, 'w') as f:
-        f.write(f"SITE {site_name}\n")
+        f.write(f"SITE {config_site_name}\n")
         f.write(f"LATITUDE {latitude_dm}\n")
         f.write(f"LONGITUDE {longitude_dm}\n")
         f.write(f"ELEVATION {elevation}\n")
@@ -2674,12 +3038,12 @@ def plot_spectrograms(df, channels, fs, nperseg=256, save_plots=False, site_name
                     # Use shorter segments for spectrogram
                     nperseg_spec = min(nperseg, len(data)//4)
                     f, t, Sxx = spectrogram(data, fs=fs, nperseg=nperseg_spec, noverlap=nperseg_spec//2)
-                    
+                    # Convert time axis to days
+                    t_days = t / (24 * 3600)
                     # Plot spectrogram
-                    im = axes[i].pcolormesh(t, f, 10 * np.log10(Sxx), shading='gouraud')
+                    im = axes[i].pcolormesh(t_days, f, 10 * np.log10(Sxx), shading='gouraud')
                     axes[i].set_ylabel('Frequency [Hz]')
                     axes[i].set_title(f'{channel} Spectrogram - {site_name}')
-                    
                     # Add colorbar
                     cbar = plt.colorbar(im, ax=axes[i])
                     cbar.set_label('Power Spectral Density [dB/Hz]')
@@ -2690,7 +3054,7 @@ def plot_spectrograms(df, channels, fs, nperseg=256, save_plots=False, site_name
         
         # Set x-axis label for the last subplot
         if len(axes) > 0:
-            axes[-1].set_xlabel('Time [s]')
+            axes[-1].set_xlabel('Time [days]')
         
         plt.tight_layout()
         
@@ -2705,6 +3069,838 @@ def plot_spectrograms(df, channels, fs, nperseg=256, save_plots=False, site_name
         
     except Exception as e:
         write_log(f"Error in plot_spectrograms: {e}", level="ERROR")
+
+
+### Filtering Functions ###
+
+def design_comb_filter(fs, notch_freq=50.0, quality_factor=30.0, harmonics=None):
+    """Design a comb filter to remove powerline noise and harmonics.
+    
+    Args:
+        fs (float): Sampling frequency in Hz
+        notch_freq (float): Fundamental frequency to notch (default: 50 Hz for powerline)
+        quality_factor (float): Quality factor for the notch filter (higher = narrower)
+        harmonics (list, optional): List of harmonic frequencies to notch. If None, uses first 5 harmonics.
+    
+    Returns:
+        tuple: (b, a) filter coefficients
+    """
+    if harmonics is None:
+        # Default to first 5 harmonics of powerline frequency
+        harmonics = [notch_freq * i for i in range(1, 6)]  # 50, 100, 150, 200, 250 Hz
+    
+    try:
+        # Start with a simple lowpass filter
+        result = butter(4, 0.1, btype='low', fs=fs)
+        if result is None or len(result) != 2:
+            raise ValueError("butter function failed to return valid coefficients")
+        b, a = result
+        
+        # Add notches for each harmonic
+        for freq in harmonics:
+            if freq < fs / 2:  # Only filter frequencies below Nyquist
+                notch_result = iirnotch(freq, quality_factor, fs)
+                if notch_result is None or len(notch_result) != 2:
+                    continue
+                notch_b, notch_a = notch_result
+                # Convolve the filters
+                b = np.convolve(b, notch_b)
+                a = np.convolve(a, notch_a)
+        
+        return b, a
+    except Exception as e:
+        write_log(f"Error in design_comb_filter: {e}", level="ERROR")
+        # Return simple pass-through filter
+        return np.array([1.0]), np.array([1.0])
+
+def design_bandpass_filter(fs, low_freq, high_freq, order=4):
+    """Design a bandpass filter.
+    
+    Args:
+        fs (float): Sampling frequency in Hz
+        low_freq (float): Lower cutoff frequency in Hz
+        high_freq (float): Upper cutoff frequency in Hz
+        order (int): Filter order
+    
+    Returns:
+        tuple: (b, a) filter coefficients
+    """
+    try:
+        nyquist = fs / 2
+        low_norm = low_freq / nyquist
+        high_norm = high_freq / nyquist
+        
+        # Ensure frequencies are within valid range
+        low_norm = max(0.001, min(low_norm, 0.999))
+        high_norm = max(0.001, min(high_norm, 0.999))
+        
+        if low_norm >= high_norm:
+            raise ValueError("Low frequency must be less than high frequency")
+        
+        result = butter(order, [low_norm, high_norm], btype='band', fs=fs)
+        if result is None or len(result) != 2:
+            raise ValueError("butter function failed to return valid coefficients")
+        return result
+    except Exception as e:
+        write_log(f"Error in design_bandpass_filter: {e}", level="ERROR")
+        # Return simple pass-through filter
+        return np.array([1.0]), np.array([1.0])
+
+def design_highpass_filter(fs, cutoff_freq, order=4):
+    """Design a highpass filter.
+    
+    Args:
+        fs (float): Sampling frequency in Hz
+        cutoff_freq (float): Cutoff frequency in Hz
+        order (int): Filter order
+    
+    Returns:
+        tuple: (b, a) filter coefficients
+    """
+    try:
+        nyquist = fs / 2
+        cutoff_norm = cutoff_freq / nyquist
+        
+        # Ensure frequency is within valid range
+        cutoff_norm = max(0.001, min(cutoff_norm, 0.999))
+        
+        result = butter(order, cutoff_norm, btype='high', fs=fs)
+        if result is None or len(result) != 2:
+            raise ValueError("butter function failed to return valid coefficients")
+        return result
+    except Exception as e:
+        write_log(f"Error in design_highpass_filter: {e}", level="ERROR")
+        # Return simple pass-through filter
+        return np.array([1.0]), np.array([1.0])
+
+def design_lowpass_filter(fs, cutoff_freq, order=4):
+    """Design a lowpass filter.
+    
+    Args:
+        fs (float): Sampling frequency in Hz
+        cutoff_freq (float): Cutoff frequency in Hz
+        order (int): Filter order
+    
+    Returns:
+        tuple: (b, a) filter coefficients
+    """
+    try:
+        nyquist = fs / 2
+        cutoff_norm = cutoff_freq / nyquist
+        
+        # Ensure frequency is within valid range
+        cutoff_norm = max(0.001, min(cutoff_norm, 0.999))
+        
+        result = butter(order, cutoff_norm, btype='low', fs=fs)
+        if result is None or len(result) != 2:
+            raise ValueError("butter function failed to return valid coefficients")
+        return result
+    except Exception as e:
+        write_log(f"Error in design_lowpass_filter: {e}", level="ERROR")
+        # Return simple pass-through filter
+        return np.array([1.0]), np.array([1.0])
+
+def apply_filter(data, b, a, filter_type="filtfilt"):
+    """Apply a filter to the data.
+    
+    Args:
+        data (np.ndarray): Input data
+        b (np.ndarray): Numerator coefficients
+        a (np.ndarray): Denominator coefficients
+        filter_type (str): Type of filtering - "filtfilt" (zero-phase) or "lfilter" (causal)
+    
+    Returns:
+        np.ndarray: Filtered data
+    """
+    if filter_type == "filtfilt":
+        # Zero-phase filtering (forward-backward)
+        return filtfilt(b, a, data)
+    elif filter_type == "lfilter":
+        # Causal filtering
+        return lfilter(b, a, data)
+    else:
+        raise ValueError("filter_type must be 'filtfilt' or 'lfilter'")
+
+def adaptive_filter(data, reference, filter_length=64, mu=0.01):
+    """Apply adaptive filtering using LMS algorithm.
+    
+    Args:
+        data (np.ndarray): Primary signal (signal + noise)
+        reference (np.ndarray): Reference signal (noise only)
+        filter_length (int): Length of adaptive filter
+        mu (float): Step size for LMS algorithm
+    
+    Returns:
+        np.ndarray: Filtered signal
+    """
+    # Ensure both signals have the same length
+    min_len = min(len(data), len(reference))
+    data = data[:min_len]
+    reference = reference[:min_len]
+    
+    # Initialize filter weights
+    w = np.zeros(filter_length)
+    
+    # Initialize output
+    y = np.zeros(min_len)
+    e = np.zeros(min_len)
+    
+    # LMS algorithm
+    for n in range(filter_length, min_len):
+        # Get reference signal window
+        x = reference[n:n-filter_length:-1]
+        
+        # Calculate filter output
+        y[n] = np.dot(w, x)
+        
+        # Calculate error
+        e[n] = data[n] - y[n]
+        
+        # Update filter weights
+        w = w + mu * e[n] * x
+    
+    return e
+
+def filter_data(df, filter_config, fs):
+    """Apply filtering to the data based on configuration.
+    
+    Args:
+        df (pd.DataFrame): Input DataFrame with channel data
+        filter_config (dict): Filter configuration
+        fs (float): Sampling frequency in Hz
+    
+    Returns:
+        pd.DataFrame: Filtered DataFrame
+    """
+    filtered_df = df.copy()
+    
+    # Get filter parameters
+    filter_type = filter_config.get('type', 'comb')
+    channels = filter_config.get('channels', ['Bx', 'By', 'Bz', 'Ex', 'Ey'])
+    filter_method = filter_config.get('method', 'filtfilt')
+    
+    write_log(f"Applying {filter_type} filter to channels: {channels}")
+    
+    if filter_type == 'comb':
+        # Comb filter for powerline noise removal
+        notch_freq = filter_config.get('notch_freq', 50.0)
+        quality_factor = filter_config.get('quality_factor', 30.0)
+        harmonics = filter_config.get('harmonics', None)
+        
+        b, a = design_comb_filter(fs, notch_freq, quality_factor, harmonics)
+        
+        for channel in channels:
+            if channel in filtered_df.columns:
+                filtered_df[channel] = apply_filter(filtered_df[channel].values, b, a, filter_method)
+                write_log(f"Applied comb filter to {channel} (notch at {notch_freq} Hz)")
+    
+    elif filter_type == 'bandpass':
+        # Bandpass filter
+        low_freq = filter_config.get('low_freq', 0.1)
+        high_freq = filter_config.get('high_freq', 10.0)
+        order = filter_config.get('order', 4)
+        
+        b, a = design_bandpass_filter(fs, low_freq, high_freq, order)
+        
+        for channel in channels:
+            if channel in filtered_df.columns:
+                filtered_df[channel] = apply_filter(filtered_df[channel].values, b, a, filter_method)
+                write_log(f"Applied bandpass filter to {channel} ({low_freq}-{high_freq} Hz)")
+    
+    elif filter_type == 'highpass':
+        # Highpass filter
+        cutoff_freq = filter_config.get('cutoff_freq', 0.1)
+        order = filter_config.get('order', 4)
+        
+        b, a = design_highpass_filter(fs, cutoff_freq, order)
+        
+        for channel in channels:
+            if channel in filtered_df.columns:
+                filtered_df[channel] = apply_filter(filtered_df[channel].values, b, a, filter_method)
+                write_log(f"Applied highpass filter to {channel} (cutoff: {cutoff_freq} Hz)")
+    
+    elif filter_type == 'lowpass':
+        # Lowpass filter
+        cutoff_freq = filter_config.get('cutoff_freq', 10.0)
+        order = filter_config.get('order', 4)
+        
+        b, a = design_lowpass_filter(fs, cutoff_freq, order)
+        
+        for channel in channels:
+            if channel in filtered_df.columns:
+                filtered_df[channel] = apply_filter(filtered_df[channel].values, b, a, filter_method)
+                write_log(f"Applied lowpass filter to {channel} (cutoff: {cutoff_freq} Hz)")
+    
+    elif filter_type == 'adaptive':
+        # Adaptive filtering (requires reference signal)
+        reference_channel = filter_config.get('reference_channel', 'rBx')
+        filter_length = filter_config.get('filter_length', 64)
+        mu = filter_config.get('mu', 0.01)
+        
+        if reference_channel in filtered_df.columns:
+            for channel in channels:
+                if channel in filtered_df.columns and channel != reference_channel:
+                    filtered_df[channel] = adaptive_filter(
+                        filtered_df[channel].values,
+                        filtered_df[reference_channel].values,
+                        filter_length,
+                        mu
+                    )
+                    write_log(f"Applied adaptive filter to {channel} using {reference_channel} as reference")
+        else:
+            write_log(f"Reference channel {reference_channel} not found for adaptive filtering", level="WARNING")
+    
+    elif filter_type == 'custom':
+        # Custom filter with user-provided coefficients
+        b = filter_config.get('b', [1.0])
+        a = filter_config.get('a', [1.0])
+        
+        for channel in channels:
+            if channel in filtered_df.columns:
+                filtered_df[channel] = apply_filter(filtered_df[channel].values, b, a, filter_method)
+                write_log(f"Applied custom filter to {channel}")
+    
+    else:
+        write_log(f"Unknown filter type: {filter_type}", level="WARNING")
+        return df
+    
+    return filtered_df
+
+def plot_filter_response(b, a, fs, filter_name="Filter", save_plot=False, output_dir="."):
+    """Plot the frequency response of a filter.
+    
+    Args:
+        b (np.ndarray): Numerator coefficients
+        a (np.ndarray): Denominator coefficients
+        fs (float): Sampling frequency in Hz
+        filter_name (str): Name for the plot
+        save_plot (bool): Whether to save the plot
+        output_dir (str): Directory to save plots
+    """
+    try:
+        from scipy.signal import freqz
+        
+        # Calculate frequency response
+        w, h = freqz(b, a, worN=8000)
+        f = w * fs / (2 * np.pi)
+        
+        # Convert to dB
+        h_db = 20 * np.log10(abs(h))
+        
+        # Create plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Magnitude response
+        ax1.semilogx(f, h_db)
+        ax1.grid(True)
+        ax1.set_xlabel('Frequency [Hz]')
+        ax1.set_ylabel('Magnitude [dB]')
+        ax1.set_title(f'{filter_name} - Magnitude Response')
+        ax1.set_xlim(0.1, fs/2)
+        ax1.set_ylim(-60, 5)
+        
+        # Phase response
+        phase = np.unwrap(np.angle(h))
+        ax2.semilogx(f, phase)
+        ax2.grid(True)
+        ax2.set_xlabel('Frequency [Hz]')
+        ax2.set_ylabel('Phase [radians]')
+        ax2.set_title(f'{filter_name} - Phase Response')
+        ax2.set_xlim(0.1, fs/2)
+        
+        plt.tight_layout()
+        
+        if save_plot:
+            filename = os.path.join(output_dir, f"{filter_name.replace(' ', '_')}_response.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Filter response plot saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error plotting filter response: {e}", level="ERROR")
+
+
+def plot_heatmaps(df, fs, save_plots=False, site_name="UnknownSite", output_dir=".", 
+                  nperseg=1024, noverlap=None, coherence_thresholds=None):
+    """Generate comprehensive heatmap plots for quality control and cultural noise detection.
+    
+    Creates three types of plots:
+    1. Coherence heatmap (period vs. time, coherence as color)
+    2. Window score barcode (quality indicators aligned with heatmap)
+    3. Coherence histograms per frequency band
+    
+    Args:
+        df (pd.DataFrame): DataFrame with channel data
+        fs (float): Sampling frequency in Hz
+        save_plots (bool): Whether to save plots to files
+        site_name (str): Site name for plot titles and filenames
+        output_dir (str): Directory to save plots in
+        nperseg (int): Number of points per segment for FFT
+        noverlap (int, optional): Number of points to overlap between segments
+        coherence_thresholds (dict, optional): Custom coherence thresholds for quality scoring
+    """
+    try:
+        from scipy.signal import coherence, spectrogram
+        import matplotlib.colors as mcolors
+        
+        # Set default overlap if not specified
+        if noverlap is None:
+            noverlap = nperseg // 2
+        
+        # Default coherence thresholds for quality scoring (green/amber/red)
+        if coherence_thresholds is None:
+            coherence_thresholds = {
+                'good': 0.7,      # Green: coherence >= 0.7
+                'fair': 0.5,      # Amber: 0.5 <= coherence < 0.7
+                'poor': 0.5       # Red: coherence < 0.5
+            }
+        
+        # Get start datetime from DataFrame index if available
+        start_datetime = None
+        if hasattr(df.index, 'dtype') and 'datetime' in str(df.index.dtype):
+            start_datetime = df.index[0]
+        elif 'datetime' in df.columns:
+            start_datetime = df['datetime'].iloc[0]
+        
+        # Define MT-specific channel pairs for coherence analysis
+        mt_pairs = []
+        if 'Bx' in df.columns and 'Ey' in df.columns:
+            mt_pairs.append(('Bx', 'Ey', 'Bx-Ey'))
+        if 'By' in df.columns and 'Ex' in df.columns:
+            mt_pairs.append(('By', 'Ex', 'By-Ex'))
+        
+        # Add remote reference pairs if available
+        if 'rBx' in df.columns:
+            if 'Bx' in df.columns:
+                mt_pairs.append(('Bx', 'rBx', 'Bx-rBx'))
+            if 'Ex' in df.columns and 'rEx' in df.columns:
+                mt_pairs.append(('Ex', 'rEx', 'Ex-rEx'))
+        if 'rBy' in df.columns:
+            if 'By' in df.columns:
+                mt_pairs.append(('By', 'rBy', 'By-rBy'))
+            if 'Ey' in df.columns and 'rEy' in df.columns:
+                mt_pairs.append(('Ey', 'rEy', 'Ey-rEy'))
+        
+        if not mt_pairs:
+            write_log(f"No valid MT channel pairs found for heatmap analysis for {site_name}", level="WARNING")
+            return
+        
+        # Create figure with subplots for each pair
+        n_pairs = len(mt_pairs)
+        fig_height = 4 * n_pairs  # 4 inches per pair
+        fig, axes = plt.subplots(n_pairs, 2, figsize=(12, fig_height))  # Changed from 3 to 2 columns
+        
+        # Handle single pair case
+        if n_pairs == 1:
+            axes = axes.reshape(1, -1)
+        
+        for pair_idx, (ch1, ch2, pair_name) in enumerate(mt_pairs):
+            if ch1 not in df.columns or ch2 not in df.columns:
+                continue
+            
+            # Get data for this pair
+            data1 = df[ch1].dropna()
+            data2 = df[ch2].dropna()
+            
+            if len(data1) == 0 or len(data2) == 0:
+                continue
+            
+            # Ensure both channels have the same length
+            min_len = min(len(data1), len(data2))
+            data1 = data1[:min_len]
+            data2 = data2[:min_len]
+            
+            # Calculate time vector
+            time_vector = np.arange(len(data1)) / fs
+            
+            # Calculate coherence over time using sliding windows
+            coherence_matrix, time_windows, freq_vector = calculate_coherence_over_time(
+                data1, data2, fs, nperseg, noverlap
+            )
+            
+            # Convert frequency to period for MT analysis
+            period_vector = 1.0 / freq_vector[1:]  # Skip DC component
+            coherence_matrix = coherence_matrix[1:, :]  # Skip DC component
+            
+            # 1. Coherence Heatmap
+            ax_heatmap = axes[pair_idx, 0]
+            
+            # Convert time axis to days for better readability
+            time_days = time_windows / (24 * 3600)  # Convert seconds to days
+            im = ax_heatmap.pcolormesh(time_days, period_vector, coherence_matrix, 
+                                      cmap='RdYlGn_r', vmin=0, vmax=1, shading='gouraud')
+            ax_heatmap.set_xlabel('Time [days]')
+            ax_heatmap.set_xlim(time_days[0], time_days[-1])
+            
+            ax_heatmap.set_yscale('log')
+            ax_heatmap.set_ylabel('Period [s]')
+            ax_heatmap.set_title(f'{pair_name} Coherence Heatmap - {site_name}')
+            ax_heatmap.grid(True, alpha=0.3)
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax_heatmap)
+            cbar.set_label('Coherence')
+            
+            # 2. Window Score Barcode (DISABLED)
+            # ax_barcode = axes[pair_idx, 1]
+            # window_scores = calculate_window_scores(coherence_matrix, coherence_thresholds)
+            # plot_window_barcode(ax_barcode, time_windows, window_scores, pair_name, site_name, start_datetime)
+            
+            # 3. Coherence Histograms
+            ax_hist = axes[pair_idx, 1]
+            plot_coherence_histograms(ax_hist, coherence_matrix, period_vector, 
+                                    coherence_thresholds, pair_name, site_name)
+        
+        plt.tight_layout()
+        
+        if save_plots:
+            filename = os.path.join(output_dir, f"{site_name}_heatmaps.png")
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            write_log(f"Heatmap plots saved as {filename}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+    except Exception as e:
+        write_log(f"Error in plot_heatmaps: {e}", level="ERROR")
+        write_log(f"Traceback: {traceback.format_exc()}", level="ERROR")
+
+
+def calculate_coherence_over_time(data1, data2, fs, nperseg, noverlap):
+    """Calculate coherence over time using sliding windows.
+    
+    Args:
+        data1 (np.ndarray): First channel data
+        data2 (np.ndarray): Second channel data
+        fs (float): Sampling frequency
+        nperseg (int): Number of points per segment
+        noverlap (int): Number of points to overlap
+        
+    Returns:
+        tuple: (coherence_matrix, time_windows, freq_vector)
+    """
+    from scipy.signal import coherence
+    
+    # Calculate number of windows
+    step = nperseg - noverlap
+    n_windows = (len(data1) - nperseg) // step + 1
+    
+    # Initialize arrays
+    coherence_matrix = []
+    time_windows = []
+    
+    # Calculate coherence for each window
+    for i in range(n_windows):
+        start_idx = i * step
+        end_idx = start_idx + nperseg
+        
+        if end_idx > len(data1):
+            break
+        
+        # Extract window data
+        window1 = data1[start_idx:end_idx]
+        window2 = data2[start_idx:end_idx]
+        
+        # Calculate coherence for this window
+        f, Cxy = coherence(window1, window2, fs=fs, nperseg=min(nperseg//2, len(window1)//2))
+        
+        coherence_matrix.append(Cxy)
+        time_windows.append(start_idx / fs)  # Center time of window
+    
+    # Convert to numpy array
+    coherence_matrix = np.array(coherence_matrix).T  # Transpose for (freq, time) format
+    time_windows = np.array(time_windows)
+    
+    return coherence_matrix, time_windows, f
+
+
+def calculate_window_scores(coherence_matrix, thresholds):
+    """Calculate quality scores for each time window based on coherence.
+    
+    Args:
+        coherence_matrix (np.ndarray): Coherence matrix (freq, time)
+        thresholds (dict): Coherence thresholds for quality scoring
+        
+    Returns:
+        np.ndarray: Quality scores (0=poor, 1=fair, 2=good)
+    """
+    # Calculate mean coherence across frequency bands for each time window
+    mean_coherence = np.mean(coherence_matrix, axis=0)
+    
+    # Assign quality scores
+    scores = np.zeros(len(mean_coherence), dtype=int)
+    scores[mean_coherence >= thresholds['good']] = 2  # Good (green)
+    scores[(mean_coherence >= thresholds['fair']) & (mean_coherence < thresholds['good'])] = 1  # Fair (amber)
+    scores[mean_coherence < thresholds['poor']] = 0  # Poor (red)
+    
+    return scores
+
+
+def plot_window_barcode(ax, time_windows, window_scores, pair_name, site_name, start_datetime=None):
+    """Plot window score barcode showing quality over time.
+    
+    Args:
+        ax (matplotlib.axes.Axes): Axes to plot on
+        time_windows (np.ndarray): Time points for windows (in seconds from start)
+        window_scores (np.ndarray): Quality scores (0=poor, 1=fair, 2=good)
+        pair_name (str): Channel pair name
+        site_name (str): Site name
+        start_datetime (datetime, optional): Start datetime (not used, kept for compatibility)
+    """
+    # Define colors for quality levels
+    colors = ['red', 'orange', 'green']
+    
+    # Calculate bar width based on time window spacing
+    if len(time_windows) > 1:
+        bar_width = time_windows[1] - time_windows[0]
+    else:
+        bar_width = 1.0
+    
+    # Create barcode plot
+    for i, (time, score) in enumerate(zip(time_windows, window_scores)):
+        if score < len(colors):  # Ensure score is valid
+            ax.bar(time, 1, width=bar_width, color=colors[score], alpha=0.8, 
+                   edgecolor='black', linewidth=0.5)
+    
+    # Convert time axis to days for better readability
+    time_days = time_windows / (24 * 3600)  # Convert seconds to days
+    ax.set_xlabel('Time [days]')
+    ax.set_xlim(time_days[0], time_days[-1])
+    
+    ax.set_ylabel('Quality')
+    ax.set_title(f'{pair_name} Window Quality Barcode - {site_name}')
+    ax.set_ylim(0, 1.2)
+    
+    # Add legend
+    legend_elements = [
+        Rectangle((0, 0), 1, 1, facecolor='green', alpha=0.8, label='Good (≥0.8)'),
+        Rectangle((0, 0), 1, 1, facecolor='orange', alpha=0.8, label='Fair (0.6-0.8)'),
+        Rectangle((0, 0), 1, 1, facecolor='red', alpha=0.8, label='Poor (<0.6)')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
+
+
+def plot_coherence_histograms(ax, coherence_matrix, period_vector, thresholds, pair_name, site_name):
+    """Plot coherence histograms for different frequency bands.
+    
+    Args:
+        ax (matplotlib.axes.Axes): Axes to plot on
+        coherence_matrix (np.ndarray): Coherence matrix (freq, time)
+        period_vector (np.ndarray): Period values
+        thresholds (dict): Coherence thresholds
+        pair_name (str): Channel pair name
+        site_name (str): Site name
+    """
+    # Define period bands for MT analysis
+    period_bands = [
+        (0.001, 0.01, 'Ultra-high freq (0.001-0.01s)'),
+        (0.01, 0.1, 'High freq (0.01-0.1s)'),
+        (0.1, 1.0, 'Mid freq (0.1-1.0s)'),
+        (1.0, 10.0, 'Low freq (1.0-10.0s)'),
+        (10.0, 100.0, 'Ultra-low freq (10-100s)')
+    ]
+    
+    # Plot histograms for each band
+    colors = ['blue', 'green', 'orange', 'red', 'purple']
+    
+    for i, (min_period, max_period, band_name) in enumerate(period_bands):
+        # Find indices for this period band
+        band_mask = (period_vector >= min_period) & (period_vector < max_period)
+        
+        if np.any(band_mask):
+            # Extract coherence values for this band
+            band_coherence = coherence_matrix[band_mask, :].flatten()
+            
+            # Plot histogram
+            ax.hist(band_coherence, bins=20, alpha=0.6, color=colors[i], 
+                   label=band_name, density=True)
+    
+    # Add threshold lines
+    for threshold_name, threshold_value in thresholds.items():
+        ax.axvline(threshold_value, color='black', linestyle='--', alpha=0.7,
+                  label=f'{threshold_name.capitalize()} ({threshold_value})')
+    
+    ax.set_xlabel('Coherence')
+    ax.set_ylabel('Density')
+    ax.set_title(f'{pair_name} Coherence Histograms - {site_name}')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+def detect_cultural_noise(coherence_matrix, time_windows, period_vector, 
+                         min_coherence_threshold=0.3, min_duration_seconds=60):
+    """Detect potential cultural noise patterns in coherence data.
+    
+    Args:
+        coherence_matrix (np.ndarray): Coherence matrix (freq, time)
+        time_windows (np.ndarray): Time points for windows
+        period_vector (np.ndarray): Period values
+        min_coherence_threshold (float): Minimum coherence threshold for noise detection
+        min_duration_seconds (float): Minimum duration for noise detection
+        
+    Returns:
+        dict: Dictionary containing detected noise patterns
+    """
+    noise_patterns = {
+        'low_coherence_regions': [],
+        'vertical_stripes': [],
+        'periodic_patterns': []
+    }
+    
+    # Detect low coherence regions (potential cultural noise)
+    low_coherence_mask = coherence_matrix < min_coherence_threshold
+    
+    # Find continuous low coherence regions in time
+    for freq_idx in range(coherence_matrix.shape[0]):
+        freq_low_mask = low_coherence_mask[freq_idx, :]
+        
+        # Find continuous regions
+        regions = find_continuous_regions(freq_low_mask)
+        
+        for start_idx, end_idx in regions:
+            start_time = time_windows[start_idx]
+            end_time = time_windows[end_idx]
+            duration = end_time - start_time
+            
+            if duration >= min_duration_seconds:
+                period = period_vector[freq_idx]
+                noise_patterns['low_coherence_regions'].append({
+                    'period': period,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'duration': duration,
+                    'frequency_idx': freq_idx
+                })
+    
+    # Detect vertical stripes (cultural cycles)
+    # Look for time periods with consistently low coherence across multiple frequencies
+    time_low_coherence = np.mean(low_coherence_mask, axis=0)
+    vertical_regions = find_continuous_regions(time_low_coherence > 0.5)  # 50% of frequencies show low coherence
+    
+    for start_idx, end_idx in vertical_regions:
+        start_time = time_windows[start_idx]
+        end_time = time_windows[end_idx]
+        duration = end_time - start_time
+        
+        if duration >= min_duration_seconds:
+            noise_patterns['vertical_stripes'].append({
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration': duration,
+                'severity': np.mean(time_low_coherence[start_idx:end_idx])
+            })
+    
+    return noise_patterns
+
+
+def find_continuous_regions(mask):
+    """Find continuous regions where mask is True.
+    
+    Args:
+        mask (np.ndarray): Boolean mask
+        
+    Returns:
+        list: List of (start_idx, end_idx) tuples
+    """
+    regions = []
+    in_region = False
+    start_idx = None
+    
+    for i, value in enumerate(mask):
+        if value and not in_region:
+            in_region = True
+            start_idx = i
+        elif not value and in_region:
+            regions.append((start_idx, i - 1))
+            in_region = False
+    
+    # Handle case where region extends to end
+    if in_region:
+        regions.append((start_idx, len(mask) - 1))
+    
+    return regions
+
+
+def generate_heatmap_report(coherence_matrix, time_windows, period_vector, 
+                           noise_patterns, pair_name, site_name):
+    """Generate a text report summarizing heatmap analysis results.
+    
+    Args:
+        coherence_matrix (np.ndarray): Coherence matrix
+        time_windows (np.ndarray): Time points
+        period_vector (np.ndarray): Period values
+        noise_patterns (dict): Detected noise patterns
+        pair_name (str): Channel pair name
+        pair_name (str): Site name
+        
+    Returns:
+        str: Formatted report text
+    """
+    report = f"""
+{'='*80}
+HEATMAP ANALYSIS REPORT - {pair_name} - {site_name}
+{'='*80}
+
+DATA SUMMARY:
+{'-'*40}
+Total time windows: {len(time_windows)}
+Time range: {time_windows[0]:.1f}s - {time_windows[-1]:.1f}s
+Period range: {period_vector[0]:.3f}s - {period_vector[-1]:.1f}s
+Frequency range: {1/period_vector[-1]:.1f} Hz - {1/period_vector[0]:.1f} Hz
+
+COHERENCE STATISTICS:
+{'-'*40}
+Mean coherence: {np.mean(coherence_matrix):.3f}
+Median coherence: {np.median(coherence_matrix):.3f}
+Std coherence: {np.std(coherence_matrix):.3f}
+Min coherence: {np.min(coherence_matrix):.3f}
+Max coherence: {np.max(coherence_matrix):.3f}
+
+QUALITY ASSESSMENT:
+{'-'*40}"""
+    
+    # Calculate quality percentages
+    mean_coherence = np.mean(coherence_matrix, axis=0)
+    good_pct = np.sum(mean_coherence >= 0.8) / len(mean_coherence) * 100
+    fair_pct = np.sum((mean_coherence >= 0.6) & (mean_coherence < 0.8)) / len(mean_coherence) * 100
+    poor_pct = np.sum(mean_coherence < 0.6) / len(mean_coherence) * 100
+    
+    report += f"""
+Good quality windows (≥0.8): {good_pct:.1f}%
+Fair quality windows (0.6-0.8): {fair_pct:.1f}%
+Poor quality windows (<0.6): {poor_pct:.1f}%
+
+NOISE DETECTION RESULTS:
+{'-'*40}"""
+    
+    if noise_patterns['low_coherence_regions']:
+        report += f"\nLow coherence regions detected: {len(noise_patterns['low_coherence_regions'])}"
+        for i, region in enumerate(noise_patterns['low_coherence_regions'][:5]):  # Show first 5
+            report += f"\n  Region {i+1}: Period={region['period']:.3f}s, "
+            report += f"Time={region['start_time']:.1f}s-{region['end_time']:.1f}s, "
+            report += f"Duration={region['duration']:.1f}s"
+        if len(noise_patterns['low_coherence_regions']) > 5:
+            report += f"\n  ... and {len(noise_patterns['low_coherence_regions']) - 5} more regions"
+    else:
+        report += "\nNo significant low coherence regions detected"
+    
+    if noise_patterns['vertical_stripes']:
+        report += f"\n\nVertical stripes (cultural cycles) detected: {len(noise_patterns['vertical_stripes'])}"
+        for i, stripe in enumerate(noise_patterns['vertical_stripes'][:3]):  # Show first 3
+            report += f"\n  Stripe {i+1}: Time={stripe['start_time']:.1f}s-{stripe['end_time']:.1f}s, "
+            report += f"Duration={stripe['duration']:.1f}s, Severity={stripe['severity']:.2f}"
+        if len(noise_patterns['vertical_stripes']) > 3:
+            report += f"\n  ... and {len(noise_patterns['vertical_stripes']) - 3} more stripes"
+    else:
+        report += "\nNo significant vertical stripes detected"
+    
+    report += f"\n\n{'='*80}\n"
+    
+    return report
 
 
 if __name__ == "__main__":
@@ -2753,6 +3949,40 @@ if __name__ == "__main__":
                         help="Run lemimt.exe on the processed output file after processing is complete")
     parser.add_argument("--lemimt_path", type=str, default="lemimt.exe",
                         help="Full path to the lemimt.exe executable (default: lemimt.exe in current directory)")
+    parser.add_argument("--apply_filtering", action="store_true", default=False,
+                        help="Apply frequency filtering to remove unwanted frequency components")
+    parser.add_argument("--filter_type", type=str, default="comb", 
+                        choices=["comb", "bandpass", "highpass", "lowpass", "adaptive", "custom"],
+                        help="Type of filter to apply (default: comb for powerline noise removal)")
+    parser.add_argument("--filter_channels", nargs="+", default=None,
+                        help="Channels to filter (default: all main channels Bx, By, Bz, Ex, Ey)")
+    parser.add_argument("--filter_notch_freq", type=float, default=50.0,
+                        help="Notch frequency for comb filter (default: 50 Hz for powerline)")
+    parser.add_argument("--filter_quality_factor", type=float, default=30.0,
+                        help="Quality factor for comb filter (higher = narrower notch, default: 30)")
+    parser.add_argument("--filter_harmonics", nargs="+", type=float, default=None,
+                        help="Specific harmonic frequencies to notch (default: first 5 harmonics)")
+    parser.add_argument("--filter_low_freq", type=float, default=0.1,
+                        help="Lower cutoff frequency for bandpass filter (default: 0.1 Hz)")
+    parser.add_argument("--filter_high_freq", type=float, default=10.0,
+                        help="Upper cutoff frequency for bandpass filter (default: 10.0 Hz)")
+    parser.add_argument("--filter_cutoff_freq", type=float, default=0.1,
+                        help="Cutoff frequency for highpass/lowpass filters (default: 0.1 Hz)")
+    parser.add_argument("--filter_order", type=int, default=4,
+                        help="Filter order for Butterworth filters (default: 4)")
+    parser.add_argument("--filter_reference_channel", type=str, default="rBx",
+                        help="Reference channel for adaptive filtering (default: rBx)")
+    parser.add_argument("--filter_length", type=int, default=64,
+                        help="Filter length for adaptive filtering (default: 64)")
+    parser.add_argument("--filter_mu", type=float, default=0.01,
+                        help="Step size for adaptive filtering (default: 0.01)")
+    parser.add_argument("--filter_method", type=str, default="filtfilt",
+                        choices=["filtfilt", "lfilter"],
+                        help="Filtering method: filtfilt (zero-phase) or lfilter (causal, default: filtfilt)")
+    parser.add_argument("--plot_heatmaps", action="store_true", help="Generate heatmap plots for quality control.")
+    parser.add_argument("--heatmap_nperseg", type=int, default=1024, help="Number of points per segment for heatmap FFT.")
+    parser.add_argument("--heatmap_noverlap", type=int, help="Number of points to overlap between heatmap segments.")
+    parser.add_argument("--heatmap_thresholds", type=str, help="Custom coherence thresholds for heatmap quality scoring.")
 
     args = parser.parse_args()
     
@@ -2767,9 +3997,27 @@ if __name__ == "__main__":
     else:
         decimation_factors = [1]  # Just process original data
         write_log("Processing original data only (no decimation)")
-    
+
+    # --- Two-letter identifier system ---
+    # Determine the run letter for this script run (use first decimation's output as base)
+    site_name = os.path.basename(args.input_dir)
+    sample_interval = 0.1  # Default, will be updated below
+    # Build base_site_name for identifier search
+    base_site_name = f"MT_{site_name}"
+    if args.remote_reference:
+        base_site_name += f"_RR-{args.remote_reference}"
+    # Use the highest sample rate for the base name (original data)
+    if hasattr(args, 'decimate') and args.decimate:
+        sample_rate = 1.0 / sample_interval
+        freq_str = f"_{int(sample_rate)}Hz" if sample_rate >= 1 else f"_{sample_rate:.1f}Hz"
+        base_site_name += freq_str
+    else:
+        base_site_name += "_10Hz"
+    run_letter = get_next_run_letter(base_site_name, ".")
+    # --- End identifier setup ---
+
     # Process each decimation factor
-    for decimation_factor in decimation_factors:
+    for file_index, decimation_factor in enumerate(decimation_factors):
         write_log(f"Processing with decimation factor: {decimation_factor}")
         
         # Create processor for this decimation factor
@@ -2799,7 +4047,27 @@ if __name__ == "__main__":
             plot_original_data=args.plot_original_data,
             save_raw_data=args.save_raw_data,
             save_processed_data=args.save_processed_data,
-            remote_reference=args.remote_reference
+            remote_reference=args.remote_reference,
+            apply_filtering=args.apply_filtering,
+            filter_type=args.filter_type,
+            filter_channels=args.filter_channels,
+            filter_params={
+                'notch_freq': args.filter_notch_freq,
+                'quality_factor': args.filter_quality_factor,
+                'harmonics': args.filter_harmonics,
+                'low_freq': args.filter_low_freq,
+                'high_freq': args.filter_high_freq,
+                'cutoff_freq': args.filter_cutoff_freq,
+                'order': args.filter_order,
+                'reference_channel': args.filter_reference_channel,
+                'filter_length': args.filter_length,
+                'mu': args.filter_mu,
+                'method': args.filter_method
+            },
+            plot_heatmaps=args.plot_heatmaps,
+            heatmap_nperseg=args.heatmap_nperseg,
+            heatmap_noverlap=args.heatmap_noverlap,
+            heatmap_thresholds=args.heatmap_thresholds
         )
         processor.tilt_correction = args.tilt_correction
         processor.save_plots = args.save_plots
@@ -2816,9 +4084,6 @@ if __name__ == "__main__":
         
         # Run lemimt processing if requested
         if args.run_lemimt and args.save_processed_data:
-            # Find the processed output file in current directory
-            site_name = os.path.basename(args.input_dir)
-            
             # Determine the filename based on decimation factor using new naming convention
             if decimation_factor == 1:
                 processed_file = os.path.join(".", f"{site_name}_10Hz_Process.txt")
@@ -2826,43 +4091,42 @@ if __name__ == "__main__":
                 sample_interval = processor.metadata.get("sample_interval", 0.1)
                 suffix = get_sample_rate_suffix(sample_interval * decimation_factor)
                 processed_file = os.path.join(".", f"{site_name}{suffix}_Process.txt")
-            
             # Check if the file exists, if not try alternative naming patterns
             if not os.path.exists(processed_file):
-                # Try to find the actual processed file by looking in the current directory
                 import glob
                 pattern = os.path.join(".", f"{site_name}*_Process.txt")
                 matching_files = glob.glob(pattern)
                 if matching_files:
-                    processed_file = matching_files[0]  # Use the first matching file
+                    processed_file = matching_files[0]
                     write_log(f"Found processed file for lemimt: {processed_file}")
                 else:
                     write_log(f"No processed files found matching pattern: {pattern}", level="WARNING")
                     continue
-            
             if os.path.exists(processed_file):
                 write_log(f"Running lemimt processing on: {processed_file}")
-                
-                # Generate config file just before running lemimt
                 try:
-                    # Try to get GPS data from the processor instance or use empty dict
-                    gps_data = getattr(processor, 'gps_data', {})
+                    gps_data = processor.gps_data if hasattr(processor, 'gps_data') and processor.gps_data else {}
                     sample_interval = processor.metadata.get("sample_interval", 0.1)
                     has_remote_reference = processor.remote_reference is not None
                     remote_reference_site = processor.remote_reference
-                    
+                    if gps_data and 'latitude' in gps_data and 'longitude' in gps_data:
+                        write_log(f"Using GPS coordinates for config: Lat={gps_data['latitude']:.6f}°, Lon={gps_data['longitude']:.6f}°")
+                    else:
+                        write_log(f"WARNING: No valid GPS data available for config generation, using defaults", level="WARNING")
+                        write_log(f"GPS data available: {list(gps_data.keys()) if gps_data else 'None'}")
                     config_file = generate_processing_config(
                         site_name=site_name,
                         gps_data=gps_data,
                         sample_interval=sample_interval,
                         has_remote_reference=has_remote_reference,
                         remote_reference_site=remote_reference_site,
-                        output_file_path=processed_file
+                        output_file_path=processed_file,
+                        run_index=run_letter,
+                        file_index=file_index
                     )
                     write_log(f"Generated config file for lemimt: {config_file}")
                 except Exception as e:
                     write_log(f"Warning: Could not generate config file: {e}", level="WARNING")
-                
                 success = processor.run_lemimt_processing(processed_file)
                 if success:
                     write_log(f"lemimt processing completed successfully for {processed_file}")
@@ -2870,9 +4134,7 @@ if __name__ == "__main__":
                     write_log(f"lemimt processing failed for {processed_file}", level="WARNING")
             else:
                 write_log(f"Processed file not found for lemimt processing: {processed_file}", level="WARNING")
-        
         write_log(f"Completed processing for decimation factor: {decimation_factor}")
-    
     write_log("All decimation processing completed")
 
 """
@@ -3101,4 +4363,118 @@ python EDL_Process.py --input_dir HDD5449 --save_processed_data --run_lemimt --d
 
 # lemimt processing with remote reference:
 python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --save_processed_data --run_lemimt
+
+# FREQUENCY FILTERING EXAMPLES
+# ============================
+
+# Basic comb filter for powerline noise removal (50 Hz and harmonics):
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --plot_data --save_plots --save_processed_data
+
+# Comb filter with custom notch frequency (60 Hz for US powerline):
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_notch_freq 60.0 --plot_data --save_plots --save_processed_data
+
+# Comb filter with custom quality factor (narrower notch):
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_quality_factor 50.0 --plot_data --save_plots --save_processed_data
+
+# Comb filter with specific harmonics only:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_harmonics 50 100 150 --plot_data --save_plots --save_processed_data
+
+# Bandpass filter for specific frequency range:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --plot_data --save_plots --save_processed_data
+
+# Highpass filter to remove DC and low-frequency drift:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type highpass --filter_cutoff_freq 0.001 --plot_data --save_plots --save_processed_data
+
+# Lowpass filter to remove high-frequency noise:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type lowpass --filter_cutoff_freq 5.0 --plot_data --save_plots --save_processed_data
+
+# Filter with custom order (higher order = sharper cutoff):
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.1 --filter_high_freq 10.0 --filter_order 8 --plot_data --save_plots --save_processed_data
+
+# Filter specific channels only:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_channels Bx By --plot_data --save_plots --save_processed_data
+
+# Adaptive filtering using remote reference (requires remote reference):
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_reference_channel rBx --plot_data --save_plots --save_processed_data
+
+# Adaptive filtering with custom parameters:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_length 128 --filter_mu 0.005 --plot_data --save_plots --save_processed_data
+
+# Use causal filtering instead of zero-phase (may introduce phase shifts):
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_method lfilter --plot_data --save_plots --save_processed_data
+
+# Filtering with other corrections:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_data --save_plots --save_processed_data
+
+# Filtering with smoothing:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_smoothing --smoothing_method median --plot_data --save_plots --save_processed_data
+
+# Filtering with frequency analysis to see the effect:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --perform_freq_analysis WMS --plot_data --save_plots --save_processed_data
+
+# Filtering with decimation:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --decimate 2 5 --plot_data --save_plots --save_processed_data
+
+# ADVANCED FILTERING COMBINATIONS
+# ===============================
+
+# Multi-stage filtering: comb filter + bandpass
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --filter_notch_freq 50.0 --plot_data --save_plots --save_processed_data
+
+# Filtering for different frequency bands (run multiple times with different parameters):
+# First: Remove powerline noise
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --save_processed_data
+# Then: Apply bandpass filter to the filtered output
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type bandpass --filter_low_freq 0.01 --filter_high_freq 1.0 --save_processed_data
+
+# Filtering with remote reference and adaptive filtering:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --apply_filtering --filter_type adaptive --filter_reference_channel rBx --filter_length 64 --filter_mu 0.01 --plot_data --save_plots --save_processed_data
+
+# NOTES ON FILTERING:
+# - Comb filters are ideal for removing powerline noise (50 Hz in Europe/Australia, 60 Hz in US)
+# - Bandpass filters are useful for focusing on specific frequency ranges of interest
+# - Highpass filters remove DC offset and low-frequency drift
+# - Lowpass filters remove high-frequency noise and aliasing
+# - Adaptive filtering requires a reference signal (usually remote reference)
+# - Zero-phase filtering (filtfilt) preserves signal timing but may have edge effects
+# - Causal filtering (lfilter) may introduce phase shifts but has no edge effects
+# - Higher filter orders provide sharper cutoffs but may introduce ringing
+# - Always check the filter response plots to ensure the filter is working as expected
+# - Consider the Nyquist frequency (fs/2) when setting filter frequencies
+# - For MT data, typical frequency ranges of interest are 0.001-10 Hz
+
+# HEATMAP EXAMPLES
+# ================
+
+# Basic heatmap generation for quality control:
+python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --save_plots --save_processed_data
+
+# Heatmap with custom FFT parameters:
+python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --heatmap_nperseg 2048 --heatmap_noverlap 1024 --save_plots --save_processed_data
+
+# Heatmap with custom coherence thresholds:
+python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --heatmap_thresholds "0.9,0.7,0.7" --save_plots --save_processed_data
+
+# Heatmap with remote reference:
+python EDL_Process.py --input_dir HDD5449 --remote_reference HDD5974 --plot_heatmaps --save_plots --save_processed_data
+
+# Heatmap with filtering and corrections:
+python EDL_Process.py --input_dir HDD5449 --apply_filtering --filter_type comb --apply_drift_correction --apply_rotation --tilt_correction --plot_heatmaps --save_plots --save_processed_data
+
+# Heatmap with frequency analysis:
+python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --perform_freq_analysis WMS --plot_coherence --save_plots --save_processed_data
+
+# Heatmap with decimation:
+python EDL_Process.py --input_dir HDD5449 --plot_heatmaps --decimate 2 5 --save_plots --save_processed_data
+
+# NOTES ON HEATMAPS:
+# - Coherence heatmaps show period vs. time with coherence as color (red=low, green=high)
+# - Window score barcodes show quality indicators aligned with heatmaps (green=good, amber=fair, red=poor)
+# - Coherence histograms show distribution of coherence values across frequency bands
+# - Vertical stripes in heatmaps often indicate cultural noise (powerlines, machinery, etc.)
+# - Low coherence regions can indicate data quality issues or cultural interference
+# - Use heatmaps for field quality control and identifying problematic time periods
+# - Custom thresholds allow adjustment based on survey conditions and data quality
+# - Larger FFT segments provide better frequency resolution but less time resolution
+# - Overlap between segments affects smoothness of the heatmap display
 """

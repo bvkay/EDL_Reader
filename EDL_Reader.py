@@ -135,11 +135,6 @@ class ASCIIReader:
                 
                 channel_data[channel] = all_data
                 min_length = min(min_length, len(all_data))
-                
-                if self.log_first_rows:
-                    first_five = all_data[:5] if len(all_data) >= 5 else all_data
-                    write_log(f"Channel {channel} first 5 values: {first_five}")
-                    outfile.write(f"Channel {channel} first 5 values: {first_five}\n")
             
             # Ensure all channels have the same length
             for channel in channel_data:
@@ -162,16 +157,6 @@ class ASCIIReader:
                     n_nans = len(df[df.isnull().any(axis=1)])
                     write_log(f"WARNING: Found {n_nans} rows with NaN values in concatenated data. Dropping these rows.", level="WARNING")
                     df = df.dropna().reset_index(drop=True)
-                
-                # Write first few rows to output file
-                if self.log_first_rows and len(df) > 0:
-                    outfile.write(f"Data directory: {self.data_dir}\n")
-                    outfile.write(f"Channels loaded: {list(channel_data.keys())}\n")
-                    outfile.write(f"Total samples: {len(df)}\n")
-                    outfile.write("First 5 rows of data:\n")
-                    for i in range(min(5, len(df))):
-                        row_str = "  ".join(f"{df.iloc[i][col]:.6f}" for col in channel_data.keys())
-                        outfile.write(row_str + "\n")
             
             self.data = df
             return df
